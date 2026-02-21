@@ -1,6 +1,55 @@
-# Changelog - Infobit Page Cache
+# Changelog - Open Cache Manager
 
 Tutte le modifiche rilevanti al plugin sono documentate in questo file.
+
+---
+
+## [2.0.0] - 2026-02-21
+
+### Rinominazione e ristrutturazione
+- **Nuovo nome**: da "Infobit Page Cache" a **Open Cache Manager**
+- **Autore**: Starter Dev Labs
+- **File principale**: `open-cache-manager.php` (era `infobit-page-cache.php`)
+- **Menu admin**: nuovo menu top-level "Cache Manager" con sottopagine
+- **Classe principale**: `Open_Cache_Manager` (era `Infobit_Page_Cache`)
+- **Directory cache**: `wp-content/cache/ocm-pages/` (era `infobit-pages/`)
+- **Opzione DB**: `open_cache_manager` (era `infobit_page_cache`)
+- **Hook pubblici**: prefisso `ocm_cache_` (era `infobit_cache_`)
+- **WP-CLI**: `wp open-cache` (era `wp infobit-cache`)
+- **Header HTTP**: `X-OCM-Cache` (era `X-Infobit-Cache`)
+- **Text domain**: `open-cache-manager`
+- **Costanti**: `OCM_VERSION`, `OCM_PLUGIN_DIR`, `OCM_PLUGIN_FILE`
+
+### Nuove funzionalità
+- **DB Optimizer**: nuova pagina admin per l'analisi e ottimizzazione della configurazione MariaDB/MySQL
+  - Rilevamento automatico RAM server e versione database
+  - Analisi di 30+ parametri: InnoDB, connessioni, buffer, query cache, logging
+  - Dashboard visuale con indicatori colorati (OK/Consigliato/Da ottimizzare)
+  - Metriche real-time: utilizzo buffer pool, hit rate, tabelle temporanee su disco, connessioni
+  - Generazione automatica snippet my.cnf con valori ottimizzati
+  - Note e best practices per ogni parametro
+- **WP-CLI db-check**: `wp open-cache db-check` per analisi database da terminale
+- **Menu admin dedicato**: menu top-level "Cache Manager" con icona dashicons-performance
+- **Struttura modulare**: directory `includes/` con classi separate
+- **Costanti plugin**: `OCM_VERSION`, `OCM_PLUGIN_DIR`, `OCM_PLUGIN_FILE` per accesso globale
+
+### Parametri database analizzati
+- **InnoDB Engine**: buffer_pool_size, buffer_pool_instances, log_file_size, log_buffer_size, flush_log_at_trx_commit, flush_method, io_capacity, io_capacity_max, read/write_io_threads, file_per_table, buffer_pool_dump/load, open_files
+- **Connessioni**: max_connections, thread_cache_size, wait_timeout, interactive_timeout
+- **Buffer e Tabelle**: table_open_cache, table_definition_cache, tmp_table_size, max_heap_table_size, join_buffer_size, sort_buffer_size, read_buffer_size, read_rnd_buffer_size
+- **Query Cache**: query_cache_type, query_cache_size (raccomandazione: OFF per WooCommerce)
+- **Logging**: slow_query_log, long_query_time, slow_query_log_file, log_slow_verbosity (MariaDB)
+- **Varie**: performance_schema, skip_name_resolve, key_buffer_size
+
+### Note di migrazione da v1.2.0 (Infobit Page Cache)
+- La vecchia directory `wp-content/cache/infobit-pages/` non viene più utilizzata
+- I vecchi hook `infobit_cache_*` non funzionano più; aggiornare a `ocm_cache_*`
+- L'opzione DB `infobit_page_cache` non viene più letta; le impostazioni vanno riconfigurate
+- Il vecchio WP-CLI `wp infobit-cache` non è più disponibile; usare `wp open-cache`
+- Dopo l'aggiornamento, rimuovere manualmente la vecchia cache:
+  ```bash
+  rm -rf wp-content/cache/infobit-pages/
+  ```
 
 ---
 
@@ -20,61 +69,32 @@ Tutte le modifiche rilevanti al plugin sono documentate in questo file.
 - Aggiunto `/compare` alla lista hardcoded degli URL esclusi
 - `get_stats()` conta ora i file `.gz` invece di `.html`
 
-### Note di migrazione da v1.1.0
-- Dopo l'aggiornamento, svuotare la cache per eliminare i vecchi file `.html`:
-  ```bash
-  rm -rf wp-content/cache/infobit-pages/[0-9a-f]*
-  ```
-- L'auto-aggiornamento del drop-in avviene automaticamente al primo accesso admin
-
 ---
 
 ## [1.1.0] - 2026-02-19
 
 ### Nuove funzionalità
 - **Gestione sicura wp-config.php**: backup automatico prima di ogni modifica, validazione pre e post scrittura, ripristino automatico se il file risulta corrotto dopo la scrittura
-- **File uninstall.php**: pulizia completa quando il plugin viene eliminato (non solo disattivato). Rimuove: opzioni DB, transients, cron, advanced-cache.php, directory cache, WP_CACHE dal wp-config.php, file backup residui
+- **File uninstall.php**: pulizia completa quando il plugin viene eliminato
 - **Disattivazione completa**: rimuove advanced-cache.php da wp-content e la directory cache con tutte le sottocartelle
 
 ### Fix
 - **Bug critico**: `clear_all()` eliminava il file `.active` durante lo svuotamento cache, disabilitando silenziosamente il plugin. Ora `.active` è preservato
-- `rmdir()` con error suppression per directory non vuote (es. directory root che contiene `.active`)
+- `rmdir()` con error suppression per directory non vuote
 - Aggiunta `remove_cache_directory()` per pulizia ricorsiva completa alla disattivazione
-
-### Bug risolti durante lo sviluppo
-- **wp-config.php corrotto alla disattivazione**: la vecchia regex di rimozione mangiava newline e produceva `<?php/**` senza spazio. Risolto con approccio riga-per-riga (explode/implode)
-- **Buffer pool MariaDB crollato dopo riavvio**: il valore non era esplicito nel .cnf ma gestito da Plesk. Risolto aggiungendo il parametro esplicitamente
 
 ---
 
 ## [1.0.0] - 2026-02-19
 
 ### Release iniziale
-
-#### Architettura
-- `advanced-cache.php`: drop-in WordPress caricato PRIMA di tutto il codice quando `WP_CACHE=true`. Intercetta richieste GET, controlla se esiste file cached valido, lo serve direttamente (bypass PHP/MySQL). Se non esiste, cattura output con `ob_start()` e salva.
-- File salvati in `wp-content/cache/infobit-pages/` con hash MD5 dell'URL, organizzati in subdirectory per i primi 2 caratteri dell'hash
-- File flag `.active` come interruttore di sicurezza
-
-#### Funzionalità
 - Cache basata su file HTML statici con pre-compressione gzip
 - TTL configurabile (default 1 ora)
-- Esclusione automatica: utenti loggati, carrello WooCommerce attivo, URL admin/checkout/account, richieste POST, query string dinamiche, risposte non-200, pagine con errori WooCommerce, pagine noindex
-- Invalidazione intelligente WooCommerce: quando un prodotto viene aggiornato, invalida pagina prodotto + homepage + shop + categorie del prodotto
-- Modalità bulk per import massivi con soglia configurabile (default 50 prodotti)
-- Admin bar con contatore pagine cached, svuotamento rapido e svuotamento singola pagina
-- Pagina impostazioni con statistiche (file, dimensione, età), TTL, URL esclusi, soglia bulk, debug mode
-- WP-CLI: `wp infobit-cache clear` e `wp infobit-cache stats`
+- Invalidazione intelligente WooCommerce
+- Modalità bulk per import massivi
+- Admin bar, pagina impostazioni, WP-CLI
 - Cron giornaliero per pulizia file scaduti
-- Scrittura atomica (tmp + rename) per evitare file corrotti sotto carico
-
-#### Hook disponibili per sviluppatori
-```php
-do_action( 'infobit_cache_bulk_start' );         // Attiva modalità bulk
-do_action( 'infobit_cache_bulk_end' );            // Termina bulk e processa
-do_action( 'infobit_cache_invalidate_product', $id ); // Invalida singolo prodotto
-do_action( 'infobit_cache_invalidate_all' );      // Svuota tutta la cache
-```
+- Scrittura atomica (tmp + rename)
 
 ---
 
@@ -83,42 +103,10 @@ do_action( 'infobit_cache_invalidate_all' );      // Svuota tutta la cache
 ### Ambiente di produzione
 - **Sito**: infobitcomputer.it (WooCommerce, 45.000+ prodotti, 15 fornitori)
 - **Server**: 62GB RAM, NVMe, Nginx+Apache (Plesk), MariaDB 10.6+
-- **Stack cache**: Cloudflare CDN (free) → Nginx proxy cache → Infobit Page Cache → Redis Object Cache → MariaDB
+- **Stack cache**: Cloudflare CDN (free) → Nginx proxy cache → Open Cache Manager → Redis Object Cache → MariaDB
 - **Risultati**: TTFB da 2.3s a 0.05-0.18s (miglioramento 15-45x)
 
-### Ottimizzazioni server correlate (non nel plugin)
+### Ottimizzazioni server correlate (ora verificabili dal DB Optimizer)
 - **MariaDB tuning**: innodb_buffer_pool_size=45GB, innodb_flush_log_at_trx_commit=2, innodb_log_file_size=1GB, innodb_io_capacity=10000, table_open_cache=4000, slow_query_log attivo
 - **Nginx**: gzip on, expires headers per immagini (1y), CSS/JS (1M), font (1y)
 - **Redis**: object cache su database 1 con socket Unix
-
-### Problemi noti e soluzioni
-- **Redis cache corrotta**: dopo disattivazione/riattivazione del plugin, la cache Redis può contenere dati inconsistenti. Soluzione: `redis-cli -n 1 FLUSHDB`
-- **Speculation Rules di Cloudflare**: può interferire con la navigazione su Chrome (prefetch al primo click). Disabilitare Speed Brain in Cloudflare o ignorare (è un'impostazione del browser, non del sito)
-- **advanced-cache.php non aggiornato**: nelle versioni pre-1.2.0 il drop-in non si aggiornava con il plugin. Dalla v1.2.0 l'auto-update è integrato
-
----
-
-## Roadmap - WP Open Cache Manager
-
-Questo plugin sarà unificato con **Open Redis Manager** in un unico plugin chiamato **WP Open Cache Manager**.
-
-### Struttura prevista
-```
-wp-open-cache-manager/
-├── wp-open-cache-manager.php      # Plugin principale
-├── advanced-cache.php             # Drop-in page cache
-├── object-cache.php               # Drop-in Redis object cache
-├── includes/
-│   ├── class-page-cache.php       # Logica page cache (da Infobit Page Cache)
-│   ├── class-redis-cache.php      # Gestione Redis (da Open Redis Manager)
-│   ├── class-cache-manager.php    # Coordinamento tra i due livelli
-│   └── class-admin-ui.php         # Pagina admin unificata
-├── uninstall.php
-└── README.md
-```
-
-### Funzionalità previste per l'unificazione
-- Dashboard unica con statistiche Page Cache + Redis
-- Flush Redis automatico alla disattivazione del page cache
-- Coordinamento invalidazione: quando si svuota il page cache, opzione per svuotare anche Redis
-- WP-CLI unificato: `wp cache clear --page`, `wp cache clear --redis`, `wp cache clear --all`
