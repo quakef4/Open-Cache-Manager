@@ -1,21 +1,26 @@
 <?php
 /**
- * Plugin Name: Infobit Page Cache
- * Plugin URI:  https://infobitcomputer.it
- * Description: Page cache leggero ottimizzato per WooCommerce con cataloghi di grandi dimensioni. Salva le pagine HTML come file statici, con invalidazione intelligente per aggiornamenti bulk dei prodotti.
- * Version:     1.2.0
- * Author:      Infobit
+ * Plugin Name: Open Cache Manager
+ * Plugin URI:  https://github.com/quakef4/Open-Cache-Manager
+ * Description: Cache manager per WordPress/WooCommerce con page cache gzip, ottimizzazione database e invalidazione intelligente per cataloghi di grandi dimensioni.
+ * Version:     2.0.0
+ * Author:      Starter Dev Labs
+ * Author URI:  https://github.com/quakef4
  * License:     GPL-2.0+
- * Text Domain: infobit-page-cache
+ * Text Domain: open-cache-manager
  *
- * @package Infobit_Page_Cache
+ * @package Open_Cache_Manager
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-class Infobit_Page_Cache {
+define( 'OCM_VERSION', '2.0.0' );
+define( 'OCM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
+define( 'OCM_PLUGIN_FILE', __FILE__ );
+
+class Open_Cache_Manager {
 
     /**
      * Directory della cache.
@@ -29,7 +34,7 @@ class Infobit_Page_Cache {
      *
      * @var string
      */
-    private $options_page = 'infobit-page-cache';
+    private $options_page = 'open-cache-manager';
 
     /**
      * TTL di default in secondi.
@@ -49,7 +54,7 @@ class Infobit_Page_Cache {
      * Costruttore.
      */
     public function __construct() {
-        $this->cache_dir = WP_CONTENT_DIR . '/cache/infobit-pages/';
+        $this->cache_dir = WP_CONTENT_DIR . '/cache/ocm-pages/';
 
         // -------------------------------------------------------
         // Hook di invalidazione WooCommerce
@@ -83,10 +88,10 @@ class Infobit_Page_Cache {
         // -------------------------------------------------------
         // Azione custom per invalidazione bulk
         // -------------------------------------------------------
-        add_action( 'infobit_cache_invalidate_product', array( $this, 'invalidate_product_cache' ) );
-        add_action( 'infobit_cache_invalidate_all',     array( $this, 'clear_all' ) );
-        add_action( 'infobit_cache_bulk_start',         array( $this, 'bulk_start' ) );
-        add_action( 'infobit_cache_bulk_end',           array( $this, 'bulk_end' ) );
+        add_action( 'ocm_cache_invalidate_product', array( $this, 'invalidate_product_cache' ) );
+        add_action( 'ocm_cache_invalidate_all',     array( $this, 'clear_all' ) );
+        add_action( 'ocm_cache_bulk_start',         array( $this, 'bulk_start' ) );
+        add_action( 'ocm_cache_bulk_end',           array( $this, 'bulk_end' ) );
 
         // -------------------------------------------------------
         // Attivazione / Disattivazione
@@ -97,12 +102,10 @@ class Infobit_Page_Cache {
         // -------------------------------------------------------
         // Cron per pulizia cache scaduta
         // -------------------------------------------------------
-        add_action( 'infobit_cache_cleanup', array( $this, 'cleanup_expired' ) );
+        add_action( 'ocm_cache_cleanup', array( $this, 'cleanup_expired' ) );
 
         // -------------------------------------------------------
         // Auto-aggiornamento advanced-cache.php
-        // Quando il plugin viene aggiornato, il drop-in in wp-content
-        // potrebbe essere una versione vecchia. Verifica e aggiorna.
         // -------------------------------------------------------
         add_action( 'admin_init', array( $this, 'maybe_update_dropin' ) );
     }
@@ -113,7 +116,6 @@ class Infobit_Page_Cache {
 
     /**
      * Attivazione del plugin.
-     * Installa il file advanced-cache.php e abilita WP_CACHE.
      */
     public function activate() {
         // Crea directory cache
@@ -132,15 +134,14 @@ class Infobit_Page_Cache {
             copy( $source, $dest );
         }
 
-        // Prova ad abilitare WP_CACHE in wp-config.php
-        // Se non è presente, lo aggiunge in modo sicuro con backup
+        // Abilita WP_CACHE in wp-config.php
         if ( ! defined( 'WP_CACHE' ) || ! WP_CACHE ) {
             $this->safe_set_wp_cache( true );
         }
 
         // Schedula pulizia giornaliera
-        if ( ! wp_next_scheduled( 'infobit_cache_cleanup' ) ) {
-            wp_schedule_event( time(), 'daily', 'infobit_cache_cleanup' );
+        if ( ! wp_next_scheduled( 'ocm_cache_cleanup' ) ) {
+            wp_schedule_event( time(), 'daily', 'ocm_cache_cleanup' );
         }
 
         // Salva opzioni di default
@@ -151,51 +152,49 @@ class Infobit_Page_Cache {
             'debug'          => 0,
             'bulk_threshold' => 50,
         );
-        if ( ! get_option( 'infobit_page_cache' ) ) {
-            add_option( 'infobit_page_cache', $defaults );
+        if ( ! get_option( 'open_cache_manager' ) ) {
+            add_option( 'open_cache_manager', $defaults );
         }
 
-        // Sincronizza gli URL esclusi su file per advanced-cache.php
-        $options = get_option( 'infobit_page_cache', $defaults );
+        // Sincronizza URL esclusi
+        $options = get_option( 'open_cache_manager', $defaults );
         $this->sync_excluded_urls( isset( $options['excluded_urls'] ) ? $options['excluded_urls'] : '' );
     }
 
     /**
      * Disattivazione del plugin.
-     * Rimuove tutto: flag, WP_CACHE, advanced-cache.php, cron, cache files.
      */
     public function deactivate() {
-        // STEP 1: rimuovi il file flag (sicurezza immediata)
+        // STEP 1: rimuovi il file flag
         $active_flag = $this->cache_dir . '.active';
         if ( file_exists( $active_flag ) ) {
             @unlink( $active_flag );
         }
 
-        // STEP 2: rimuovi WP_CACHE dal wp-config.php in modo sicuro
+        // STEP 2: rimuovi WP_CACHE dal wp-config.php
         $this->safe_set_wp_cache( false );
 
-        // STEP 3: rimuovi advanced-cache.php da wp-content
-        // Solo se è il nostro (controlla il marker nel file)
+        // STEP 3: rimuovi advanced-cache.php
         $advanced_cache = WP_CONTENT_DIR . '/advanced-cache.php';
         if ( file_exists( $advanced_cache ) ) {
             $content = @file_get_contents( $advanced_cache );
-            if ( $content !== false && strpos( $content, 'Infobit Page Cache' ) !== false ) {
+            if ( $content !== false && strpos( $content, 'Open Cache Manager' ) !== false ) {
                 @unlink( $advanced_cache );
             }
         }
 
         // STEP 4: rimuovi cron
-        wp_clear_scheduled_hook( 'infobit_cache_cleanup' );
+        wp_clear_scheduled_hook( 'ocm_cache_cleanup' );
 
-        // STEP 5: svuota tutti i file cache
+        // STEP 5: svuota cache
         $this->clear_all();
 
-        // STEP 6: rimuovi la directory cache stessa
+        // STEP 6: rimuovi directory cache
         $this->remove_cache_directory();
     }
 
     /**
-     * Rimuove ricorsivamente la directory cache e tutte le sottocartelle.
+     * Rimuove ricorsivamente la directory cache.
      */
     private function remove_cache_directory() {
         if ( ! is_dir( $this->cache_dir ) ) {
@@ -217,11 +216,10 @@ class Infobit_Page_Cache {
 
         @rmdir( $this->cache_dir );
 
-        // Rimuovi anche la directory parent /cache/ se è vuota
         $parent_cache = WP_CONTENT_DIR . '/cache/';
         if ( is_dir( $parent_cache ) ) {
             $remaining = @scandir( $parent_cache );
-            if ( $remaining !== false && count( $remaining ) <= 2 ) { // solo . e ..
+            if ( $remaining !== false && count( $remaining ) <= 2 ) {
                 @rmdir( $parent_cache );
             }
         }
@@ -229,8 +227,6 @@ class Infobit_Page_Cache {
 
     /**
      * Verifica e aggiorna il drop-in advanced-cache.php se necessario.
-     * Confronta il contenuto del file nel plugin con quello in wp-content.
-     * Se diversi, aggiorna automaticamente.
      */
     public function maybe_update_dropin() {
         $source = plugin_dir_path( __FILE__ ) . 'advanced-cache.php';
@@ -240,19 +236,16 @@ class Infobit_Page_Cache {
             return;
         }
 
-        // Se il drop-in non esiste, copialo
         if ( ! file_exists( $dest ) ) {
             @copy( $source, $dest );
             return;
         }
 
-        // Se il drop-in non è il nostro, non toccarlo
         $dest_content = @file_get_contents( $dest );
-        if ( $dest_content === false || strpos( $dest_content, 'Infobit Page Cache' ) === false ) {
+        if ( $dest_content === false || strpos( $dest_content, 'Open Cache Manager' ) === false ) {
             return;
         }
 
-        // Confronta: se diversi, aggiorna
         $source_hash = md5_file( $source );
         $dest_hash   = md5_file( $dest );
         if ( $source_hash !== $dest_hash ) {
@@ -266,55 +259,43 @@ class Infobit_Page_Cache {
 
     /**
      * Aggiunge o rimuove WP_CACHE dal wp-config.php in modo sicuro.
-     * 
-     * Procedura:
-     * 1. Crea un backup del file originale (.bak)
-     * 2. Modifica il file
-     * 3. Verifica che il file modificato sia valido (contiene <?php e DB_NAME)
-     * 4. Se la verifica fallisce, ripristina il backup
      *
      * @param bool $enable True per aggiungere, false per rimuovere.
-     * @return bool True se la modifica è riuscita, false altrimenti.
+     * @return bool
      */
     private function safe_set_wp_cache( $enable ) {
         $config_file  = ABSPATH . 'wp-config.php';
-        $backup_file  = ABSPATH . 'wp-config.php.infobit-bak';
-        $marker       = "define( 'WP_CACHE', true ); // Infobit Page Cache";
+        $backup_file  = ABSPATH . 'wp-config.php.ocm-bak';
+        $marker       = "define( 'WP_CACHE', true ); // Open Cache Manager";
 
-        // Verifiche preliminari
         if ( ! file_exists( $config_file ) ) {
             $this->set_admin_notice( 'Errore: wp-config.php non trovato.' );
             return false;
         }
 
         if ( ! is_writable( $config_file ) ) {
-            $this->set_admin_notice( 
-                'Infobit Page Cache: wp-config.php non è scrivibile. Aggiungi/rimuovi manualmente: <code>' . $marker . '</code>' 
+            $this->set_admin_notice(
+                'Open Cache Manager: wp-config.php non è scrivibile. Aggiungi/rimuovi manualmente: <code>' . $marker . '</code>'
             );
             return false;
         }
 
-        // Leggi il contenuto attuale
         $original_content = file_get_contents( $config_file );
         if ( $original_content === false || strlen( $original_content ) < 100 ) {
             $this->set_admin_notice( 'Errore: impossibile leggere wp-config.php.' );
             return false;
         }
 
-        // STEP 1: Crea backup
         if ( ! copy( $config_file, $backup_file ) ) {
             $this->set_admin_notice( 'Errore: impossibile creare il backup di wp-config.php.' );
             return false;
         }
 
-        // STEP 2: Prepara il nuovo contenuto
         if ( $enable ) {
-            // Controlla se è già presente
-            if ( strpos( $original_content, 'Infobit Page Cache' ) !== false ) {
+            if ( strpos( $original_content, 'Open Cache Manager' ) !== false ) {
                 @unlink( $backup_file );
-                return true; // Già presente, nulla da fare
+                return true;
             }
-            // Aggiungi dopo <?php sulla prima riga
             $new_content = preg_replace(
                 '/^(<\?php)\s*$/m',
                 "<?php\n" . $marker,
@@ -322,104 +303,82 @@ class Infobit_Page_Cache {
                 1,
                 $count
             );
-            // Se la regex non ha matchato (<?php non è su una riga da solo), prova alternativa
             if ( $count === 0 ) {
                 $new_content = str_replace(
                     '<?php',
                     "<?php\n" . $marker,
                     $original_content
                 );
-                // Assicurati che sia stato aggiunto una sola volta
                 $occurrences = substr_count( $new_content, $marker );
                 if ( $occurrences > 1 ) {
-                    // Rimuovi tutti e aggiungi solo il primo
                     $new_content = str_replace( "\n" . $marker, '', $original_content );
                     $new_content = str_replace( '<?php', "<?php\n" . $marker, $new_content );
                 }
             }
         } else {
-            // Rimuovi la riga con il marker
-            if ( strpos( $original_content, 'Infobit Page Cache' ) === false ) {
+            if ( strpos( $original_content, 'Open Cache Manager' ) === false ) {
                 @unlink( $backup_file );
-                return true; // Non presente, nulla da fare
+                return true;
             }
-            // Rimuovi l'intera riga che contiene il marker
             $lines = explode( "\n", $original_content );
             $new_lines = array();
             foreach ( $lines as $line ) {
-                if ( strpos( $line, 'Infobit Page Cache' ) === false ) {
+                if ( strpos( $line, 'Open Cache Manager' ) === false ) {
                     $new_lines[] = $line;
                 }
             }
             $new_content = implode( "\n", $new_lines );
         }
 
-        // STEP 3: Verifica che il nuovo contenuto sia valido PRIMA di scriverlo
         if ( ! $this->validate_wp_config_content( $new_content ) ) {
             @unlink( $backup_file );
             $this->set_admin_notice( 'Errore: la modifica di wp-config.php produrrebbe un file non valido. Operazione annullata.' );
             return false;
         }
 
-        // STEP 4: Scrivi il nuovo contenuto
         $result = file_put_contents( $config_file, $new_content, LOCK_EX );
         if ( $result === false ) {
-            // Ripristina il backup
             copy( $backup_file, $config_file );
             @unlink( $backup_file );
             $this->set_admin_notice( 'Errore: impossibile scrivere wp-config.php. File ripristinato dal backup.' );
             return false;
         }
 
-        // STEP 5: Verifica il file scritto rileggendolo
         $written_content = file_get_contents( $config_file );
         if ( ! $this->validate_wp_config_content( $written_content ) ) {
-            // File corrotto! Ripristina il backup
             copy( $backup_file, $config_file );
             @unlink( $backup_file );
             $this->set_admin_notice( 'Errore: wp-config.php corrotto dopo la scrittura. File ripristinato dal backup.' );
             return false;
         }
 
-        // Tutto ok, rimuovi il backup
         @unlink( $backup_file );
         return true;
     }
 
     /**
-     * Valida che il contenuto di wp-config.php sia strutturalmente corretto.
+     * Valida il contenuto di wp-config.php.
      *
      * @param string $content Il contenuto da validare.
-     * @return bool True se valido, false se corrotto.
+     * @return bool
      */
     private function validate_wp_config_content( $content ) {
-        // Deve contenere <?php come apertura
         if ( strpos( $content, '<?php' ) === false ) {
             return false;
         }
 
-        // Deve contenere le definizioni essenziali di WordPress
-        $required_strings = array(
-            'DB_NAME',
-            'DB_USER',
-            'DB_HOST',
-            'ABSPATH',
-            'wp-settings.php',
-        );
-
+        $required_strings = array( 'DB_NAME', 'DB_USER', 'DB_HOST', 'ABSPATH', 'wp-settings.php' );
         foreach ( $required_strings as $required ) {
             if ( strpos( $content, $required ) === false ) {
                 return false;
             }
         }
 
-        // Non deve avere <?php duplicato all'inizio (segno di corruzione)
         $php_count = substr_count( substr( $content, 0, 100 ), '<?php' );
         if ( $php_count > 1 ) {
             return false;
         }
 
-        // Il contenuto non deve essere troppo corto (file troncato)
         if ( strlen( $content ) < 500 ) {
             return false;
         }
@@ -433,7 +392,7 @@ class Infobit_Page_Cache {
      * @param string $message Il messaggio da mostrare.
      */
     private function set_admin_notice( $message ) {
-        set_transient( 'infobit_cache_notice', $message, 60 );
+        set_transient( 'ocm_cache_notice', $message, 60 );
     }
 
     // =============================================================
@@ -457,15 +416,6 @@ class Infobit_Page_Cache {
         if ( file_exists( $cache_file ) ) {
             @unlink( $cache_file );
         }
-
-        // Pulizia legacy: rimuovi anche eventuali vecchi file .html
-        $legacy_html = $this->cache_dir . substr( $cache_key, 0, 2 ) . '/' . $cache_key . '.html';
-        if ( file_exists( $legacy_html ) ) {
-            @unlink( $legacy_html );
-        }
-        if ( file_exists( $legacy_html . '.gz' ) ) {
-            @unlink( $legacy_html . '.gz' );
-        }
     }
 
     /**
@@ -474,33 +424,28 @@ class Infobit_Page_Cache {
      * @param int $product_id ID del prodotto.
      */
     public function invalidate_product_cache( $product_id ) {
-        // Se siamo in modalità bulk, accumula e invalida dopo
         if ( $this->bulk_mode ) {
-            $pending = get_transient( 'infobit_cache_bulk_ids' );
+            $pending = get_transient( 'ocm_cache_bulk_ids' );
             if ( ! is_array( $pending ) ) {
                 $pending = array();
             }
             $pending[] = $product_id;
-            set_transient( 'infobit_cache_bulk_ids', $pending, HOUR_IN_SECONDS );
+            set_transient( 'ocm_cache_bulk_ids', $pending, HOUR_IN_SECONDS );
             return;
         }
 
-        // Pagina prodotto
         $permalink = get_permalink( $product_id );
         if ( $permalink ) {
             $this->invalidate_url( $permalink );
         }
 
-        // Homepage
         $this->invalidate_url( home_url( '/' ) );
 
-        // Pagina shop
         $shop_id = function_exists( 'wc_get_page_id' ) ? wc_get_page_id( 'shop' ) : 0;
         if ( $shop_id > 0 ) {
             $this->invalidate_url( get_permalink( $shop_id ) );
         }
 
-        // Categorie del prodotto
         $terms = get_the_terms( $product_id, 'product_cat' );
         if ( $terms && ! is_wp_error( $terms ) ) {
             foreach ( $terms as $term ) {
@@ -509,31 +454,16 @@ class Infobit_Page_Cache {
         }
     }
 
-    /**
-     * Invalida cache quando un prodotto viene aggiornato.
-     *
-     * @param int $product_id ID del prodotto.
-     */
     public function on_product_update( $product_id ) {
         $this->invalidate_product_cache( $product_id );
     }
 
-    /**
-     * Invalida cache quando un prodotto viene eliminato.
-     *
-     * @param int $product_id ID del prodotto.
-     */
     public function on_product_delete( $product_id ) {
         if ( get_post_type( $product_id ) === 'product' ) {
             $this->invalidate_product_cache( $product_id );
         }
     }
 
-    /**
-     * Invalida quando lo stock di una variazione cambia.
-     *
-     * @param WC_Product $product Oggetto prodotto.
-     */
     public function on_variation_stock_change( $product ) {
         $parent_id = $product->get_parent_id();
         if ( $parent_id ) {
@@ -541,27 +471,16 @@ class Infobit_Page_Cache {
         }
     }
 
-    /**
-     * Invalida quando lo stock di un prodotto cambia.
-     *
-     * @param WC_Product $product Oggetto prodotto.
-     */
     public function on_product_stock_change( $product ) {
         $this->invalidate_product_cache( $product->get_id() );
     }
 
-    /**
-     * Invalida cache per post/pagine generiche.
-     *
-     * @param int     $post_id ID del post.
-     * @param WP_Post $post    Oggetto post.
-     */
     public function on_save_post( $post_id, $post ) {
         if ( wp_is_post_revision( $post_id ) || wp_is_post_autosave( $post_id ) ) {
             return;
         }
         if ( $post->post_type === 'product' ) {
-            return; // Gestito da woocommerce_update_product
+            return;
         }
         if ( in_array( $post->post_status, array( 'publish', 'trash' ), true ) ) {
             $this->invalidate_url( get_permalink( $post_id ) );
@@ -569,11 +488,6 @@ class Infobit_Page_Cache {
         }
     }
 
-    /**
-     * Invalida cache quando un post viene eliminato.
-     *
-     * @param int $post_id ID del post.
-     */
     public function on_delete_post( $post_id ) {
         $permalink = get_permalink( $post_id );
         if ( $permalink ) {
@@ -583,34 +497,25 @@ class Infobit_Page_Cache {
     }
 
     // =============================================================
-    //  MODALITÀ BULK
+    //  MODALITA' BULK
     // =============================================================
 
-    /**
-     * Attiva la modalità bulk.
-     * Durante un aggiornamento massivo, le invalidazioni vengono accumulate
-     * e processate alla fine per evitare di invalidare la cache migliaia di volte.
-     */
     public function bulk_start() {
         $this->bulk_mode = true;
-        set_transient( 'infobit_cache_bulk_ids', array(), HOUR_IN_SECONDS );
+        set_transient( 'ocm_cache_bulk_ids', array(), HOUR_IN_SECONDS );
     }
 
-    /**
-     * Termina la modalità bulk e processa le invalidazioni accumulate.
-     */
     public function bulk_end() {
         $this->bulk_mode = false;
-        $pending = get_transient( 'infobit_cache_bulk_ids' );
+        $pending = get_transient( 'ocm_cache_bulk_ids' );
 
         if ( ! is_array( $pending ) || empty( $pending ) ) {
             return;
         }
 
-        $options   = get_option( 'infobit_page_cache', array() );
+        $options   = get_option( 'open_cache_manager', array() );
         $threshold = isset( $options['bulk_threshold'] ) ? (int) $options['bulk_threshold'] : 50;
 
-        // Se troppi prodotti modificati, svuota tutta la cache
         $unique_ids = array_unique( $pending );
         if ( count( $unique_ids ) > $threshold ) {
             $this->clear_all();
@@ -620,7 +525,7 @@ class Infobit_Page_Cache {
             }
         }
 
-        delete_transient( 'infobit_cache_bulk_ids' );
+        delete_transient( 'ocm_cache_bulk_ids' );
     }
 
     // =============================================================
@@ -647,14 +552,12 @@ class Infobit_Page_Cache {
         foreach ( $iterator as $item ) {
             if ( $item->isFile() ) {
                 $basename = basename( $item->getPathname() );
-                // Preserva file di configurazione del plugin
                 if ( $basename === '.active' || $basename === '.excluded_urls' ) {
                     continue;
                 }
                 @unlink( $item->getPathname() );
                 $count++;
             } elseif ( $item->isDir() ) {
-                // rmdir fallisce se la dir non è vuota (es. contiene .active), ok ignorare
                 @rmdir( $item->getPathname() );
             }
         }
@@ -670,7 +573,7 @@ class Infobit_Page_Cache {
             return;
         }
 
-        $options = get_option( 'infobit_page_cache', array() );
+        $options = get_option( 'open_cache_manager', array() );
         $ttl     = isset( $options['ttl'] ) ? (int) $options['ttl'] : $this->default_ttl;
         $now     = time();
 
@@ -681,7 +584,6 @@ class Infobit_Page_Cache {
         foreach ( $iterator as $file ) {
             if ( $file->isFile() && ( $now - $file->getMTime() ) > $ttl ) {
                 $basename = basename( $file->getPathname() );
-                // Preserva file di configurazione del plugin
                 if ( $basename === '.active' || $basename === '.excluded_urls' ) {
                     continue;
                 }
@@ -697,14 +599,14 @@ class Infobit_Page_Cache {
     /**
      * Restituisce statistiche sulla cache.
      *
-     * @return array Statistiche.
+     * @return array
      */
     public function get_stats() {
         $stats = array(
-            'files'      => 0,
-            'size'       => 0,
-            'oldest'     => 0,
-            'newest'     => 0,
+            'files'  => 0,
+            'size'   => 0,
+            'oldest' => 0,
+            'newest' => 0,
         );
 
         if ( ! is_dir( $this->cache_dir ) ) {
@@ -737,11 +639,6 @@ class Infobit_Page_Cache {
     //  ADMIN BAR
     // =============================================================
 
-    /**
-     * Aggiunge il pulsante nella admin bar.
-     *
-     * @param WP_Admin_Bar $wp_admin_bar Oggetto admin bar.
-     */
     public function admin_bar_button( $wp_admin_bar ) {
         if ( ! current_user_can( 'manage_options' ) ) {
             return;
@@ -750,64 +647,62 @@ class Infobit_Page_Cache {
         $stats = $this->get_stats();
 
         $wp_admin_bar->add_node( array(
-            'id'    => 'infobit-page-cache',
-            'title' => sprintf( '⚡ Cache (%d)', $stats['files'] ),
+            'id'    => 'ocm-cache',
+            'title' => sprintf( 'OCM Cache (%d)', $stats['files'] ),
             'href'  => '#',
         ) );
 
         $wp_admin_bar->add_node( array(
-            'parent' => 'infobit-page-cache',
-            'id'     => 'infobit-cache-clear',
-            'title'  => '🗑 Svuota tutta la cache',
-            'href'   => wp_nonce_url( admin_url( 'admin.php?action=infobit_clear_cache' ), 'infobit_clear_cache' ),
+            'parent' => 'ocm-cache',
+            'id'     => 'ocm-cache-clear',
+            'title'  => 'Svuota tutta la cache',
+            'href'   => wp_nonce_url( admin_url( 'admin.php?action=ocm_clear_cache' ), 'ocm_clear_cache' ),
         ) );
 
         $wp_admin_bar->add_node( array(
-            'parent' => 'infobit-page-cache',
-            'id'     => 'infobit-cache-clear-page',
-            'title'  => '🔄 Svuota cache di questa pagina',
+            'parent' => 'ocm-cache',
+            'id'     => 'ocm-cache-clear-page',
+            'title'  => 'Svuota cache di questa pagina',
             'href'   => wp_nonce_url(
-                admin_url( 'admin.php?action=infobit_clear_page_cache&url=' . urlencode( $this->get_current_url() ) ),
-                'infobit_clear_page_cache'
+                admin_url( 'admin.php?action=ocm_clear_page_cache&url=' . urlencode( $this->get_current_url() ) ),
+                'ocm_clear_page_cache'
             ),
         ) );
 
         $wp_admin_bar->add_node( array(
-            'parent' => 'infobit-page-cache',
-            'id'     => 'infobit-cache-stats',
+            'parent' => 'ocm-cache',
+            'id'     => 'ocm-cache-stats',
             'title'  => sprintf(
-                '📊 %d pagine cached (%s)',
+                '%d pagine cached (%s)',
                 $stats['files'],
                 $this->format_bytes( $stats['size'] )
             ),
-            'href'   => admin_url( 'options-general.php?page=' . $this->options_page ),
+            'href'   => admin_url( 'admin.php?page=' . $this->options_page ),
         ) );
     }
 
     /**
-     * Gestisce le azioni admin (svuota cache, ecc.).
+     * Gestisce le azioni admin.
      */
     public function handle_admin_actions() {
-        // Svuota tutta la cache
-        if ( isset( $_GET['action'] ) && $_GET['action'] === 'infobit_clear_cache' ) {
-            if ( ! current_user_can( 'manage_options' ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'infobit_clear_cache' ) ) {
+        if ( isset( $_GET['action'] ) && $_GET['action'] === 'ocm_clear_cache' ) {
+            if ( ! current_user_can( 'manage_options' ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'ocm_clear_cache' ) ) {
                 wp_die( 'Non autorizzato' );
             }
             $count = $this->clear_all();
-            set_transient( 'infobit_cache_notice', sprintf( 'Cache svuotata! %d file eliminati.', $count ), 30 );
+            set_transient( 'ocm_cache_notice', sprintf( 'Cache svuotata! %d file eliminati.', $count ), 30 );
             wp_safe_redirect( wp_get_referer() ? wp_get_referer() : admin_url() );
             exit;
         }
 
-        // Svuota cache singola pagina
-        if ( isset( $_GET['action'] ) && $_GET['action'] === 'infobit_clear_page_cache' ) {
-            if ( ! current_user_can( 'manage_options' ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'infobit_clear_page_cache' ) ) {
+        if ( isset( $_GET['action'] ) && $_GET['action'] === 'ocm_clear_page_cache' ) {
+            if ( ! current_user_can( 'manage_options' ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'ocm_clear_page_cache' ) ) {
                 wp_die( 'Non autorizzato' );
             }
             $url = isset( $_GET['url'] ) ? urldecode( $_GET['url'] ) : '';
             if ( $url ) {
                 $this->invalidate_url( $url );
-                set_transient( 'infobit_cache_notice', 'Cache della pagina svuotata!', 30 );
+                set_transient( 'ocm_cache_notice', 'Cache della pagina svuotata!', 30 );
             }
             wp_safe_redirect( $url ? $url : ( wp_get_referer() ? wp_get_referer() : admin_url() ) );
             exit;
@@ -818,51 +713,71 @@ class Infobit_Page_Cache {
      * Mostra le notifiche admin.
      */
     public function admin_notices() {
-        $notice = get_transient( 'infobit_cache_notice' );
+        $notice = get_transient( 'ocm_cache_notice' );
         if ( $notice ) {
             printf( '<div class="notice notice-success is-dismissible"><p>%s</p></div>', wp_kses_post( $notice ) );
-            delete_transient( 'infobit_cache_notice' );
+            delete_transient( 'ocm_cache_notice' );
         }
     }
 
     // =============================================================
-    //  PAGINA IMPOSTAZIONI
+    //  PAGINA IMPOSTAZIONI & MENU ADMIN
     // =============================================================
 
     /**
-     * Aggiunge il menu nelle impostazioni.
+     * Aggiunge il menu admin con pagine.
      */
     public function add_admin_menu() {
-        add_options_page(
-            'Infobit Page Cache',
-            'Infobit Cache',
+        // Menu principale
+        add_menu_page(
+            'Open Cache Manager',
+            'Cache Manager',
+            'manage_options',
+            $this->options_page,
+            array( $this, 'render_settings_page' ),
+            'dashicons-performance',
+            80
+        );
+
+        // Sottopagina: Page Cache (stessa del menu principale)
+        add_submenu_page(
+            $this->options_page,
+            'Page Cache - Open Cache Manager',
+            'Page Cache',
             'manage_options',
             $this->options_page,
             array( $this, 'render_settings_page' )
         );
+
+        // Sottopagina: Ottimizzazione Database
+        add_submenu_page(
+            $this->options_page,
+            'DB Optimizer - Open Cache Manager',
+            'DB Optimizer',
+            'manage_options',
+            'ocm-db-optimizer',
+            array( $this, 'render_db_optimizer_page' )
+        );
     }
 
     /**
-     * Renderizza la pagina delle impostazioni.
+     * Renderizza la pagina delle impostazioni Page Cache.
      */
     public function render_settings_page() {
         // Salva impostazioni
-        if ( isset( $_POST['infobit_cache_save'] ) && wp_verify_nonce( $_POST['_wpnonce'], 'infobit_cache_settings' ) ) {
+        if ( isset( $_POST['ocm_cache_save'] ) && wp_verify_nonce( $_POST['_wpnonce'], 'ocm_cache_settings' ) ) {
             $options = array(
                 'ttl'            => max( 60, (int) $_POST['ttl'] ),
                 'excluded_urls'  => sanitize_textarea_field( $_POST['excluded_urls'] ),
                 'debug'          => isset( $_POST['debug'] ) ? 1 : 0,
                 'bulk_threshold' => max( 10, (int) $_POST['bulk_threshold'] ),
             );
-            update_option( 'infobit_page_cache', $options );
-
-            // Scrivi il file .excluded_urls per advanced-cache.php
+            update_option( 'open_cache_manager', $options );
             $this->sync_excluded_urls( $options['excluded_urls'] );
-
             echo '<div class="notice notice-success"><p>Impostazioni salvate!</p></div>';
         }
 
-        $options = wp_parse_args( get_option( 'infobit_page_cache', array() ), array(
+        $options = wp_parse_args( get_option( 'open_cache_manager', array() ), array(
             'ttl'            => $this->default_ttl,
             'excluded_urls'  => '',
             'debug'          => 0,
@@ -872,11 +787,12 @@ class Infobit_Page_Cache {
         $stats = $this->get_stats();
         ?>
         <div class="wrap">
-            <h1>⚡ Infobit Page Cache</h1>
+            <h1>Open Cache Manager - Page Cache</h1>
+            <p class="description">v<?php echo esc_html( OCM_VERSION ); ?> | Cache file gzip per WordPress/WooCommerce</p>
 
             <!-- Statistiche -->
             <div class="card" style="max-width:600px; padding:15px; margin-bottom:20px;">
-                <h2>📊 Statistiche</h2>
+                <h2>Statistiche</h2>
                 <table class="widefat" style="max-width:400px;">
                     <tr><th>Pagine in cache</th><td><strong><?php echo (int) $stats['files']; ?></strong></td></tr>
                     <tr><th>Dimensione totale</th><td><strong><?php echo esc_html( $this->format_bytes( $stats['size'] ) ); ?></strong></td></tr>
@@ -890,16 +806,16 @@ class Infobit_Page_Cache {
                     </tr>
                 </table>
                 <br>
-                <a href="<?php echo wp_nonce_url( admin_url( 'admin.php?action=infobit_clear_cache' ), 'infobit_clear_cache' ); ?>"
+                <a href="<?php echo wp_nonce_url( admin_url( 'admin.php?action=ocm_clear_cache' ), 'ocm_clear_cache' ); ?>"
                    class="button button-secondary"
                    onclick="return confirm('Svuotare tutta la cache?');">
-                    🗑 Svuota tutta la cache
+                    Svuota tutta la cache
                 </a>
             </div>
 
             <!-- Impostazioni -->
             <form method="post">
-                <?php wp_nonce_field( 'infobit_cache_settings' ); ?>
+                <?php wp_nonce_field( 'ocm_cache_settings' ); ?>
 
                 <table class="form-table">
                     <tr>
@@ -948,32 +864,226 @@ class Infobit_Page_Cache {
                 </table>
 
                 <p class="submit">
-                    <input type="submit" name="infobit_cache_save" class="button button-primary" value="Salva impostazioni">
+                    <input type="submit" name="ocm_cache_save" class="button button-primary" value="Salva impostazioni">
                 </p>
             </form>
 
             <!-- Guida -->
             <div class="card" style="max-width:600px; padding:15px;">
-                <h2>📖 Uso negli aggiornamenti bulk</h2>
+                <h2>Uso negli aggiornamenti bulk</h2>
                 <p>Nei tuoi script di importazione/aggiornamento prodotti, usa questi hook per ottimizzare l'invalidazione:</p>
                 <pre style="background:#f0f0f0; padding:10px; overflow-x:auto;">
 // Prima dell'aggiornamento bulk
-do_action( 'infobit_cache_bulk_start' );
+do_action( 'ocm_cache_bulk_start' );
 
 // ... aggiorna i prodotti ...
 
 // Dopo l'aggiornamento bulk
-do_action( 'infobit_cache_bulk_end' );
+do_action( 'ocm_cache_bulk_end' );
                 </pre>
-                <p>Questo evita di invalidare la cache migliaia di volte durante un import.</p>
                 <h3>Invalidazione manuale da codice</h3>
                 <pre style="background:#f0f0f0; padding:10px; overflow-x:auto;">
 // Invalida un singolo prodotto
-do_action( 'infobit_cache_invalidate_product', $product_id );
+do_action( 'ocm_cache_invalidate_product', $product_id );
 
 // Invalida tutta la cache
-do_action( 'infobit_cache_invalidate_all' );
+do_action( 'ocm_cache_invalidate_all' );
                 </pre>
+            </div>
+        </div>
+        <?php
+    }
+
+    /**
+     * Renderizza la pagina DB Optimizer.
+     */
+    public function render_db_optimizer_page() {
+        require_once OCM_PLUGIN_DIR . 'includes/class-db-optimizer.php';
+        $optimizer = new OCM_DB_Optimizer();
+
+        $sections     = $optimizer->get_recommendations();
+        $summary      = $optimizer->get_summary();
+        $bp_info      = $optimizer->get_buffer_pool_usage();
+        $tmp_info     = $optimizer->get_tmp_table_stats();
+        $conn_info    = $optimizer->get_connection_stats();
+        $config       = $optimizer->generate_config_snippet();
+        ?>
+        <div class="wrap">
+            <h1>Open Cache Manager - DB Optimizer</h1>
+            <p class="description">Analisi e ottimizzazione della configurazione <?php echo $optimizer->is_mariadb() ? 'MariaDB' : 'MySQL'; ?> per WooCommerce</p>
+
+            <style>
+                .ocm-db-cards { display: flex; gap: 15px; flex-wrap: wrap; margin: 15px 0; }
+                .ocm-db-card { background: #fff; border: 1px solid #c3c4c7; border-left: 4px solid #2271b1; padding: 15px 20px; min-width: 180px; flex: 1; }
+                .ocm-db-card.ok { border-left-color: #00a32a; }
+                .ocm-db-card.warning { border-left-color: #dba617; }
+                .ocm-db-card.critical { border-left-color: #d63638; }
+                .ocm-db-card h3 { margin: 0 0 5px 0; font-size: 13px; color: #50575e; text-transform: uppercase; }
+                .ocm-db-card .value { font-size: 28px; font-weight: 600; line-height: 1.2; }
+                .ocm-db-param-table { border-collapse: collapse; width: 100%; }
+                .ocm-db-param-table th, .ocm-db-param-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #e0e0e0; }
+                .ocm-db-param-table th { background: #f6f7f7; font-weight: 600; }
+                .ocm-db-param-table tr:hover td { background: #f9f9f9; }
+                .ocm-status { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: 600; }
+                .ocm-status.ok { background: #d4edda; color: #155724; }
+                .ocm-status.warning { background: #fff3cd; color: #856404; }
+                .ocm-status.critical { background: #f8d7da; color: #721c24; }
+                .ocm-status.info { background: #d1ecf1; color: #0c5460; }
+                .ocm-section { background: #fff; border: 1px solid #c3c4c7; margin: 20px 0; }
+                .ocm-section h2 { margin: 0; padding: 12px 15px; background: #f6f7f7; border-bottom: 1px solid #c3c4c7; font-size: 14px; }
+                .ocm-section .inside { padding: 0; }
+                .ocm-section .description { padding: 8px 15px; margin: 0; color: #646970; font-style: italic; border-bottom: 1px solid #f0f0f0; }
+                .ocm-config-box { background: #1d2327; color: #c3c4c7; padding: 15px; font-family: monospace; font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-x: auto; max-height: 500px; }
+                .ocm-progress-bar { background: #e0e0e0; border-radius: 4px; height: 20px; overflow: hidden; }
+                .ocm-progress-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+            </style>
+
+            <!-- Riepilogo server -->
+            <div class="ocm-db-cards">
+                <div class="ocm-db-card">
+                    <h3>Database</h3>
+                    <div class="value" style="font-size:16px;"><?php echo esc_html( $optimizer->get_db_version() ); ?></div>
+                    <small><?php echo $optimizer->is_mariadb() ? 'MariaDB' : 'MySQL'; ?></small>
+                </div>
+                <div class="ocm-db-card">
+                    <h3>RAM Server</h3>
+                    <div class="value" style="font-size:16px;"><?php echo esc_html( $optimizer->get_total_ram_formatted() ); ?></div>
+                </div>
+                <div class="ocm-db-card ok">
+                    <h3>Parametri OK</h3>
+                    <div class="value"><?php echo (int) $summary['ok']; ?></div>
+                </div>
+                <div class="ocm-db-card <?php echo $summary['critical'] > 0 ? 'critical' : 'ok'; ?>">
+                    <h3>Da ottimizzare</h3>
+                    <div class="value"><?php echo (int) $summary['critical']; ?></div>
+                </div>
+                <div class="ocm-db-card <?php echo $summary['warning'] > 0 ? 'warning' : 'ok'; ?>">
+                    <h3>Consigliati</h3>
+                    <div class="value"><?php echo (int) $summary['warning']; ?></div>
+                </div>
+            </div>
+
+            <!-- Buffer Pool Usage -->
+            <div class="ocm-db-cards">
+                <div class="ocm-db-card" style="flex:2;">
+                    <h3>InnoDB Buffer Pool</h3>
+                    <div style="margin:8px 0;">
+                        <strong>Dimensione:</strong> <?php echo esc_html( $bp_info['size_formatted'] ); ?> |
+                        <strong>Utilizzo:</strong> <?php echo esc_html( $bp_info['usage_pct'] ); ?>% |
+                        <strong>Hit Rate:</strong> <?php echo esc_html( $bp_info['hit_rate'] ); ?>%
+                    </div>
+                    <div class="ocm-progress-bar">
+                        <div class="ocm-progress-fill" style="width:<?php echo esc_attr( min( 100, $bp_info['usage_pct'] ) ); ?>%; background:<?php echo $bp_info['hit_rate'] >= 99 ? '#00a32a' : ( $bp_info['hit_rate'] >= 95 ? '#dba617' : '#d63638' ); ?>;"></div>
+                    </div>
+                    <small style="color:#646970;">
+                        Pagine totali: <?php echo number_format( $bp_info['pages_total'] ); ?> |
+                        Pagine dati: <?php echo number_format( $bp_info['pages_data'] ); ?> |
+                        Pagine libere: <?php echo number_format( $bp_info['pages_free'] ); ?>
+                    </small>
+                </div>
+                <div class="ocm-db-card">
+                    <h3>Tabelle temporanee</h3>
+                    <div style="margin:8px 0;">
+                        <strong>Su disco:</strong> <?php echo esc_html( $tmp_info['disk_pct'] ); ?>%
+                    </div>
+                    <div class="ocm-progress-bar">
+                        <div class="ocm-progress-fill" style="width:<?php echo esc_attr( min( 100, $tmp_info['disk_pct'] ) ); ?>%; background:<?php echo $tmp_info['disk_pct'] <= 25 ? '#00a32a' : ( $tmp_info['disk_pct'] <= 50 ? '#dba617' : '#d63638' ); ?>;"></div>
+                    </div>
+                    <small style="color:#646970;">
+                        In memoria: <?php echo number_format( $tmp_info['memory_tables'] ); ?> |
+                        Su disco: <?php echo number_format( $tmp_info['disk_tables'] ); ?>
+                    </small>
+                </div>
+                <div class="ocm-db-card">
+                    <h3>Connessioni</h3>
+                    <div style="margin:8px 0;">
+                        <strong>Max usate:</strong> <?php echo (int) $conn_info['max_used']; ?>/<?php echo (int) $conn_info['max_connections']; ?> (<?php echo esc_html( $conn_info['usage_pct'] ); ?>%)
+                    </div>
+                    <div class="ocm-progress-bar">
+                        <div class="ocm-progress-fill" style="width:<?php echo esc_attr( min( 100, $conn_info['usage_pct'] ) ); ?>%; background:<?php echo $conn_info['usage_pct'] <= 70 ? '#00a32a' : ( $conn_info['usage_pct'] <= 85 ? '#dba617' : '#d63638' ); ?>;"></div>
+                    </div>
+                    <small style="color:#646970;">
+                        Attive: <?php echo (int) $conn_info['current_connected']; ?> |
+                        Running: <?php echo (int) $conn_info['current_running']; ?> |
+                        Aborted: <?php echo number_format( $conn_info['aborted'] ); ?>
+                    </small>
+                </div>
+            </div>
+
+            <!-- Sezioni parametri -->
+            <?php foreach ( $sections as $section ) : ?>
+            <div class="ocm-section">
+                <h2><?php echo esc_html( $section['title'] ); ?></h2>
+                <?php if ( ! empty( $section['description'] ) ) : ?>
+                    <p class="description"><?php echo esc_html( $section['description'] ); ?></p>
+                <?php endif; ?>
+                <div class="inside">
+                    <table class="ocm-db-param-table">
+                        <thead>
+                            <tr>
+                                <th style="width:25%;">Parametro</th>
+                                <th style="width:15%;">Valore attuale</th>
+                                <th style="width:15%;">Raccomandato</th>
+                                <th style="width:10%;">Stato</th>
+                                <th style="width:35%;">Descrizione</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach ( $section['params'] as $param ) :
+                            $analyzed = $optimizer->analyze_param( $param );
+                        ?>
+                            <tr>
+                                <td><code><?php echo esc_html( $analyzed['name'] ); ?></code></td>
+                                <td><strong><?php echo esc_html( $optimizer->format_current( $analyzed ) ); ?></strong></td>
+                                <td><?php echo esc_html( $optimizer->format_recommended( $analyzed ) ); ?></td>
+                                <td><span class="ocm-status <?php echo esc_attr( $analyzed['status'] ); ?>"><?php echo esc_html( $analyzed['status_text'] ); ?></span></td>
+                                <td><small><?php echo esc_html( $analyzed['description'] ); ?></small></td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <?php endforeach; ?>
+
+            <!-- Configurazione generata -->
+            <div class="ocm-section">
+                <h2>Configurazione raccomandata per my.cnf</h2>
+                <p class="description">Copia questa configurazione nel file di configurazione del database (es. /etc/mysql/mariadb.conf.d/50-server.cnf). Riavvia il servizio MySQL/MariaDB dopo la modifica.</p>
+                <div class="inside">
+                    <div style="padding: 10px 15px;">
+                        <button type="button" class="button button-secondary" onclick="
+                            var el = document.getElementById('ocm-config-output');
+                            if (navigator.clipboard) {
+                                navigator.clipboard.writeText(el.textContent).then(function() {
+                                    alert('Configurazione copiata negli appunti!');
+                                });
+                            } else {
+                                var range = document.createRange();
+                                range.selectNode(el);
+                                window.getSelection().removeAllRanges();
+                                window.getSelection().addRange(range);
+                                document.execCommand('copy');
+                                alert('Configurazione copiata negli appunti!');
+                            }
+                        ">Copia configurazione</button>
+                        <span style="margin-left: 10px; color: #646970;">Percorsi tipici: <code>/etc/mysql/mariadb.conf.d/50-server.cnf</code> o <code>/etc/mysql/my.cnf</code></span>
+                    </div>
+                    <div class="ocm-config-box" id="ocm-config-output"><?php echo esc_html( $config ); ?></div>
+                </div>
+            </div>
+
+            <!-- Note importanti -->
+            <div class="card" style="max-width:800px; padding:15px; margin-top:20px;">
+                <h2>Note importanti</h2>
+                <ul style="list-style:disc; padding-left:20px;">
+                    <li><strong>Backup prima di modificare:</strong> Fai sempre un backup di my.cnf prima di applicare le modifiche.</li>
+                    <li><strong>Riavvio necessario:</strong> La maggior parte dei parametri InnoDB richiede il riavvio del servizio MySQL/MariaDB per avere effetto.</li>
+                    <li><strong>innodb_log_file_size:</strong> La modifica di questo parametro richiede uno shutdown pulito del database. MariaDB ricrea automaticamente i file di log al riavvio.</li>
+                    <li><strong>Buffer pool warmup:</strong> Dopo il riavvio, il buffer pool parte vuoto. Con <code>innodb_buffer_pool_dump_at_shutdown</code> e <code>innodb_buffer_pool_load_at_startup</code> attivi, il warmup è automatico.</li>
+                    <li><strong>Valori per-connessione:</strong> Parametri come <code>sort_buffer_size</code>, <code>join_buffer_size</code>, <code>read_buffer_size</code> sono allocati per ogni connessione. Valori troppo alti moltiplicati per max_connections possono esaurire la RAM.</li>
+                    <li><strong>Query Cache:</strong> Per WooCommerce con aggiornamenti frequenti (import bulk), la query cache causa più overhead che benefici. Si consiglia di disabilitarla e usare Redis come object cache.</li>
+                </ul>
             </div>
         </div>
         <?php
@@ -983,13 +1093,6 @@ do_action( 'infobit_cache_invalidate_all' );
     //  UTILITY
     // =============================================================
 
-    /**
-     * Sincronizza gli URL esclusi su file per advanced-cache.php.
-     * advanced-cache.php non ha accesso al database WordPress,
-     * quindi legge le esclusioni custom da un file.
-     *
-     * @param string $excluded_urls Gli URL esclusi, uno per riga.
-     */
     private function sync_excluded_urls( $excluded_urls ) {
         $file = $this->cache_dir . '.excluded_urls';
 
@@ -1004,16 +1107,10 @@ do_action( 'infobit_cache_invalidate_all' );
             return;
         }
 
-        // Pulisci e scrivi le righe
         $lines = array_filter( array_map( 'trim', explode( "\n", $excluded_urls ) ) );
         file_put_contents( $file, implode( "\n", $lines ), LOCK_EX );
     }
 
-    /**
-     * Restituisce l'URL corrente.
-     *
-     * @return string
-     */
     private function get_current_url() {
         if ( is_admin() ) {
             return home_url( '/' );
@@ -1022,12 +1119,6 @@ do_action( 'infobit_cache_invalidate_all' );
         return $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
     }
 
-    /**
-     * Formatta i byte in formato leggibile.
-     *
-     * @param int $bytes Numero di byte.
-     * @return string
-     */
     private function format_bytes( $bytes ) {
         if ( $bytes === 0 ) return '0 B';
         $units = array( 'B', 'KB', 'MB', 'GB' );
@@ -1037,26 +1128,23 @@ do_action( 'infobit_cache_invalidate_all' );
 }
 
 // Inizializza il plugin
-new Infobit_Page_Cache();
+new Open_Cache_Manager();
 
 // =============================================================
 //  WP-CLI
 // =============================================================
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
 
-    /**
-     * Comandi WP-CLI per Infobit Page Cache.
-     */
-    class Infobit_Cache_CLI {
+    class OCM_Cache_CLI {
 
         /**
          * Svuota tutta la cache.
          *
          * ## EXAMPLES
-         *     wp infobit-cache clear
+         *     wp open-cache clear
          */
         public function clear() {
-            $plugin = new Infobit_Page_Cache();
+            $plugin = new Open_Cache_Manager();
             $count  = $plugin->clear_all();
             WP_CLI::success( sprintf( 'Cache svuotata. %d file eliminati.', $count ) );
         }
@@ -1065,10 +1153,10 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
          * Mostra statistiche della cache.
          *
          * ## EXAMPLES
-         *     wp infobit-cache stats
+         *     wp open-cache stats
          */
         public function stats() {
-            $plugin = new Infobit_Page_Cache();
+            $plugin = new Open_Cache_Manager();
             $stats  = $plugin->get_stats();
 
             WP_CLI::line( sprintf( 'Pagine in cache: %d', $stats['files'] ) );
@@ -1082,6 +1170,41 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
             }
         }
 
+        /**
+         * Analizza la configurazione del database.
+         *
+         * ## EXAMPLES
+         *     wp open-cache db-check
+         */
+        public function db_check() {
+            require_once OCM_PLUGIN_DIR . 'includes/class-db-optimizer.php';
+            $optimizer = new OCM_DB_Optimizer();
+            $sections  = $optimizer->get_recommendations();
+            $summary   = $optimizer->get_summary();
+
+            WP_CLI::line( '' );
+            WP_CLI::line( sprintf( 'Database: %s (%s)', $optimizer->get_db_version(), $optimizer->is_mariadb() ? 'MariaDB' : 'MySQL' ) );
+            WP_CLI::line( sprintf( 'RAM Server: %s', $optimizer->get_total_ram_formatted() ) );
+            WP_CLI::line( sprintf( 'OK: %d | Da ottimizzare: %d | Consigliati: %d', $summary['ok'], $summary['critical'], $summary['warning'] ) );
+            WP_CLI::line( '' );
+
+            foreach ( $sections as $section ) {
+                WP_CLI::line( '--- ' . $section['title'] . ' ---' );
+                $items = array();
+                foreach ( $section['params'] as $param ) {
+                    $analyzed = $optimizer->analyze_param( $param );
+                    $items[]  = array(
+                        'Parametro'    => $analyzed['name'],
+                        'Attuale'      => $optimizer->format_current( $analyzed ),
+                        'Raccomandato' => $optimizer->format_recommended( $analyzed ),
+                        'Stato'        => strtoupper( $analyzed['status_text'] ),
+                    );
+                }
+                WP_CLI\Utils\format_items( 'table', $items, array( 'Parametro', 'Attuale', 'Raccomandato', 'Stato' ) );
+                WP_CLI::line( '' );
+            }
+        }
+
         private function format_bytes( $bytes ) {
             if ( $bytes === 0 ) return '0 B';
             $units = array( 'B', 'KB', 'MB', 'GB' );
@@ -1090,5 +1213,5 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
         }
     }
 
-    WP_CLI::add_command( 'infobit-cache', 'Infobit_Cache_CLI' );
+    WP_CLI::add_command( 'open-cache', 'OCM_Cache_CLI' );
 }

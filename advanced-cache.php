@@ -1,14 +1,14 @@
 <?php
 /**
- * Infobit Page Cache - Advanced Cache Drop-in
- * 
+ * Open Cache Manager - Advanced Cache Drop-in
+ *
  * Questo file viene caricato da WordPress PRIMA di qualsiasi altro codice
  * quando WP_CACHE è definito come true in wp-config.php.
- * 
+ *
  * Va copiato in: wp-content/advanced-cache.php
- * 
- * @package Infobit_Page_Cache
- * @version 1.2.0
+ *
+ * @package Open_Cache_Manager
+ * @version 2.0.0
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -18,12 +18,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 // ============================================================
 // CONTROLLO DI SICUREZZA
 // ============================================================
-$plugin_check = WP_CONTENT_DIR . '/plugins/infobit-page-cache/infobit-page-cache.php';
+$plugin_check = WP_CONTENT_DIR . '/plugins/Open-Cache-Manager/open-cache-manager.php';
 if ( ! file_exists( $plugin_check ) ) {
     return;
 }
 
-$active_flag = WP_CONTENT_DIR . '/cache/infobit-pages/.active';
+$active_flag = WP_CONTENT_DIR . '/cache/ocm-pages/.active';
 if ( ! file_exists( $active_flag ) ) {
     return;
 }
@@ -31,9 +31,9 @@ if ( ! file_exists( $active_flag ) ) {
 // ============================================================
 // CONFIGURAZIONE
 // ============================================================
-define( 'INFOBIT_CACHE_DIR', WP_CONTENT_DIR . '/cache/infobit-pages/' );
-define( 'INFOBIT_CACHE_TTL', 3600 );
-define( 'INFOBIT_CACHE_DEBUG', false );
+define( 'OCM_CACHE_DIR', WP_CONTENT_DIR . '/cache/ocm-pages/' );
+define( 'OCM_CACHE_TTL', 3600 );
+define( 'OCM_CACHE_DEBUG', false );
 
 // ============================================================
 // CONDIZIONI DI ESCLUSIONE
@@ -65,7 +65,6 @@ if ( ! empty( $_COOKIE ) ) {
         if ( strpos( $cookie_name, 'wordpress_logged_in_' ) === 0 ) {
             $is_logged_in = true;
         }
-        // wp-settings-time-{user_id} è impostato solo per utenti con accesso wp-admin
         if ( strpos( $cookie_name, 'wp-settings-time-' ) === 0 ) {
             $is_admin_user = true;
         }
@@ -75,8 +74,6 @@ if ( ! empty( $_COOKIE ) ) {
     if ( $is_logged_in && $is_admin_user ) {
         return;
     }
-
-    // Cliente loggato → cache OK, ma le pagine personali sono già escluse sotto
 }
 
 // No carrello WooCommerce attivo
@@ -115,7 +112,7 @@ $excluded_paths = array(
 );
 
 // Leggi esclusioni custom da file
-$custom_excluded_file = WP_CONTENT_DIR . '/cache/infobit-pages/.excluded_urls';
+$custom_excluded_file = WP_CONTENT_DIR . '/cache/ocm-pages/.excluded_urls';
 if ( file_exists( $custom_excluded_file ) ) {
     $custom_excluded = file( $custom_excluded_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
     if ( is_array( $custom_excluded ) ) {
@@ -136,15 +133,15 @@ foreach ( $excluded_paths as $excluded ) {
 
 $cache_host = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : 'localhost';
 $cache_key  = md5( $cache_host . $request_uri );
-$cache_file = INFOBIT_CACHE_DIR . substr( $cache_key, 0, 2 ) . '/' . $cache_key . '.gz';
+$cache_file = OCM_CACHE_DIR . substr( $cache_key, 0, 2 ) . '/' . $cache_key . '.gz';
 
 // Controlla se esiste una versione cached valida
 if ( file_exists( $cache_file ) ) {
     $file_age = time() - filemtime( $cache_file );
 
-    if ( $file_age < INFOBIT_CACHE_TTL ) {
-        header( 'X-Infobit-Cache: HIT' );
-        header( 'X-Infobit-Cache-Age: ' . $file_age );
+    if ( $file_age < OCM_CACHE_TTL ) {
+        header( 'X-OCM-Cache: HIT' );
+        header( 'X-OCM-Cache-Age: ' . $file_age );
         header( 'Content-Type: text/html; charset=UTF-8' );
 
         // Verifica se il client accetta gzip
@@ -152,12 +149,11 @@ if ( file_exists( $cache_file ) ) {
             && strpos( $_SERVER['HTTP_ACCEPT_ENCODING'], 'gzip' ) !== false;
 
         if ( $accepts_gzip ) {
-            // Serve il file gzip direttamente (caso normale, tutti i browser moderni)
             header( 'Content-Encoding: gzip' );
             header( 'Vary: Accept-Encoding' );
             readfile( $cache_file );
         } else {
-            // Fallback rarissimo: decomprime al volo per client senza gzip
+            // Fallback: decomprime al volo per client senza gzip
             $gz_content = file_get_contents( $cache_file );
             if ( $gz_content !== false ) {
                 echo gzdecode( $gz_content );
@@ -168,16 +164,16 @@ if ( file_exists( $cache_file ) ) {
 }
 
 // Cache MISS: cattura l'output e salvalo
-header( 'X-Infobit-Cache: MISS' );
+header( 'X-OCM-Cache: MISS' );
 
 /**
  * Callback di output buffering.
  * Salva l'HTML generato nella cache come file gzip.
  *
  * @param string $html L'output HTML della pagina.
- * @return string L'HTML inalterato (al browser va la versione non compressa).
+ * @return string L'HTML inalterato.
  */
-function infobit_cache_output_callback( $html ) {
+function ocm_cache_output_callback( $html ) {
 
     // Non cachare pagine troppo corte (errori, redirect)
     if ( strlen( $html ) < 1000 ) {
@@ -199,15 +195,15 @@ function infobit_cache_output_callback( $html ) {
         return $html;
     }
 
-    $cache_file = $GLOBALS['infobit_cache_file'];
+    $cache_file = $GLOBALS['ocm_cache_file'];
     $cache_dir  = dirname( $cache_file );
 
     if ( ! is_dir( $cache_dir ) ) {
         mkdir( $cache_dir, 0755, true );
     }
 
-    if ( INFOBIT_CACHE_DEBUG ) {
-        $html .= "\n<!-- Infobit Page Cache | Cached: " . date( 'Y-m-d H:i:s' ) . " -->";
+    if ( OCM_CACHE_DEBUG ) {
+        $html .= "\n<!-- Open Cache Manager | Cached: " . date( 'Y-m-d H:i:s' ) . " -->";
     }
 
     // Comprimi e salva solo il gzip
@@ -227,5 +223,5 @@ function infobit_cache_output_callback( $html ) {
     return $html;
 }
 
-$GLOBALS['infobit_cache_file'] = $cache_file;
-ob_start( 'infobit_cache_output_callback' );
+$GLOBALS['ocm_cache_file'] = $cache_file;
+ob_start( 'ocm_cache_output_callback' );
