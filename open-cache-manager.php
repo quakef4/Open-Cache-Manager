@@ -108,6 +108,11 @@ class Open_Cache_Manager {
         // Auto-aggiornamento advanced-cache.php
         // -------------------------------------------------------
         add_action( 'admin_init', array( $this, 'maybe_update_dropin' ) );
+
+        // -------------------------------------------------------
+        // Cache warm-up per navigazione AJAX/PJAX (Woodmart)
+        // -------------------------------------------------------
+        add_action( 'wp_footer', array( $this, 'maybe_print_warmup_script' ) );
     }
 
     // =============================================================
@@ -1292,6 +1297,57 @@ do_action( 'ocm_cache_invalidate_all' );
                 </ul>
             </div>
         </div>
+        <?php
+    }
+
+    // =============================================================
+    //  CACHE WARM-UP PER NAVIGAZIONE AJAX/PJAX
+    // =============================================================
+
+    /**
+     * Stampa uno script inline nelle pagine shop/categoria WooCommerce.
+     *
+     * Quando Woodmart (ajax_shop / PJAX) naviga verso un URL filtrato,
+     * il browser cambia URL via pushState ma il drop-in non riceve mai
+     * un "document" request — solo XHR parziali che vengono skippati.
+     *
+     * Questo script intercetta i cambi di URL e invia un fetch() in
+     * background senza cookie e senza header XHR. Il drop-in lo vede
+     * come una visita anonima normale: MISS → salva .gz.
+     * Il prossimo visitatore (o Googlebot) ottiene un HIT immediato.
+     */
+    public function maybe_print_warmup_script() {
+        if ( ! function_exists( 'is_shop' ) ) {
+            return;
+        }
+        if ( ! is_shop() && ! is_product_category() && ! is_product_taxonomy() && ! is_product_tag() ) {
+            return;
+        }
+        ?>
+        <script>
+        /* OCM Cache Warm-up: pre-cacha pagine filtrate navigate via AJAX/PJAX */
+        (function(){
+            var timer, lastUrl = location.href;
+            var origPushState = history.pushState;
+
+            function warmup() {
+                var currentUrl = location.href;
+                if ( currentUrl === lastUrl ) return;
+                lastUrl = currentUrl;
+                clearTimeout( timer );
+                timer = setTimeout( function() {
+                    fetch( currentUrl, { credentials: 'omit', cache: 'no-store' } );
+                }, 2000 );
+            }
+
+            history.pushState = function() {
+                origPushState.apply( this, arguments );
+                warmup();
+            };
+
+            window.addEventListener( 'popstate', warmup );
+        })();
+        </script>
         <?php
     }
 
