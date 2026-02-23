@@ -204,16 +204,19 @@ function ocm_cache_output_callback( $html ) {
 
     // Non salvare pagine troppo corte (probabile redirect o errore)
     if ( strlen( $html ) < 500 ) {
+        @header( 'X-OCM-Save: skip-short-' . strlen( $html ) );
         return $html;
     }
 
     // Non salvare se non sembra HTML valido
     if ( stripos( $html, '<html' ) === false && stripos( $html, '<!DOCTYPE' ) === false ) {
+        @header( 'X-OCM-Save: skip-no-html' );
         return $html;
     }
 
     // Non salvare pagine con messaggi di errore WooCommerce visibili
     if ( strpos( $html, 'woocommerce-error' ) !== false ) {
+        @header( 'X-OCM-Save: skip-woo-error' );
         return $html;
     }
 
@@ -223,7 +226,8 @@ function ocm_cache_output_callback( $html ) {
     // Crea la sottodirectory se non esiste
     if ( ! is_dir( $cache_dir ) ) {
         if ( ! @mkdir( $cache_dir, 0755, true ) ) {
-            return $html; // Non si può creare la directory, salta
+            @header( 'X-OCM-Save: skip-mkdir-failed' );
+            return $html;
         }
     }
 
@@ -233,18 +237,30 @@ function ocm_cache_output_callback( $html ) {
     }
 
     // Comprimi e salva con scrittura atomica (tmp → rename)
-    if ( function_exists( 'gzencode' ) ) {
-        $compressed = gzencode( $html, 6 );
-        if ( $compressed !== false ) {
-            $tmp = $cache_file . '.tmp.' . getmypid();
-            if ( @file_put_contents( $tmp, $compressed, LOCK_EX ) !== false ) {
-                @rename( $tmp, $cache_file );
-            } else {
-                @unlink( $tmp );
-            }
-        }
+    if ( ! function_exists( 'gzencode' ) ) {
+        @header( 'X-OCM-Save: skip-no-gzencode' );
+        return $html;
     }
 
+    $compressed = gzencode( $html, 6 );
+    if ( $compressed === false ) {
+        @header( 'X-OCM-Save: skip-gzencode-failed' );
+        return $html;
+    }
+
+    $tmp = $cache_file . '.tmp.' . getmypid();
+    if ( @file_put_contents( $tmp, $compressed, LOCK_EX ) === false ) {
+        @header( 'X-OCM-Save: skip-write-failed path=' . $tmp );
+        return $html;
+    }
+
+    if ( ! @rename( $tmp, $cache_file ) ) {
+        @unlink( $tmp );
+        @header( 'X-OCM-Save: skip-rename-failed' );
+        return $html;
+    }
+
+    @header( 'X-OCM-Save: ok' );
     return $html;
 }
 
