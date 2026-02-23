@@ -18,13 +18,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 // ============================================================
 // CONTROLLO DI SICUREZZA
 // ============================================================
-$plugin_check = WP_CONTENT_DIR . '/plugins/Open-Cache-Manager/open-cache-manager.php';
-if ( ! file_exists( $plugin_check ) ) {
+$active_flag = WP_CONTENT_DIR . '/cache/ocm-pages/.active';
+if ( ! file_exists( $active_flag ) ) {
     return;
 }
 
-$active_flag = WP_CONTENT_DIR . '/cache/ocm-pages/.active';
-if ( ! file_exists( $active_flag ) ) {
+// Il file .active contiene il path reale del plugin (indipendente dal nome cartella)
+$ocm_plugin_dir = trim( @file_get_contents( $active_flag ) );
+if ( ! $ocm_plugin_dir || ! file_exists( $ocm_plugin_dir . 'open-cache-manager.php' ) ) {
     return;
 }
 
