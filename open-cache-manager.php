@@ -156,9 +156,10 @@ class Open_Cache_Manager {
             add_option( 'open_cache_manager', $defaults );
         }
 
-        // Sincronizza URL esclusi
+        // Sincronizza URL esclusi e TTL con i file letti dal drop-in
         $options = get_option( 'open_cache_manager', $defaults );
         $this->sync_excluded_urls( isset( $options['excluded_urls'] ) ? $options['excluded_urls'] : '' );
+        $this->sync_ttl( isset( $options['ttl'] ) ? (int) $options['ttl'] : $this->default_ttl );
     }
 
     /**
@@ -935,6 +936,7 @@ class Open_Cache_Manager {
             );
             update_option( 'open_cache_manager', $options );
             $this->sync_excluded_urls( $options['excluded_urls'] );
+            $this->sync_ttl( $options['ttl'] );
             echo '<div class="notice notice-success"><p>Impostazioni salvate!</p></div>';
         }
 
@@ -1313,6 +1315,18 @@ do_action( 'ocm_cache_invalidate_all' );
 
         $lines = array_filter( array_map( 'trim', explode( "\n", $excluded_urls ) ) );
         file_put_contents( $file, implode( "\n", $lines ), LOCK_EX );
+    }
+
+    /**
+     * Scrive il file .ttl letto dal drop-in (non ha accesso al DB).
+     *
+     * @param int $ttl Durata in secondi.
+     */
+    private function sync_ttl( $ttl ) {
+        if ( ! is_dir( $this->cache_dir ) ) {
+            mkdir( $this->cache_dir, 0755, true );
+        }
+        file_put_contents( $this->cache_dir . '.ttl', (int) $ttl, LOCK_EX );
     }
 
     private function get_current_url() {
