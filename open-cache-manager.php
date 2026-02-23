@@ -123,8 +123,8 @@ class Open_Cache_Manager {
             mkdir( $this->cache_dir, 0755, true );
         }
 
-        // Crea file flag che indica che il plugin è attivo
-        file_put_contents( $this->cache_dir . '.active', time() );
+        // Crea file flag che indica che il plugin è attivo (contiene il path del plugin)
+        file_put_contents( $this->cache_dir . '.active', plugin_dir_path( __FILE__ ) );
 
         // Copia advanced-cache.php
         $source = plugin_dir_path( __FILE__ ) . 'advanced-cache.php';
