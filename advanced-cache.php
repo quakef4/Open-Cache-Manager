@@ -68,14 +68,17 @@ if ( ! empty( $_POST ) ) {
     return;
 }
 
-// No query string con parametri dinamici WooCommerce / WordPress
-$excluded_params = array( 'add-to-cart', 'remove_item', 'added-to-cart', 'wc-ajax', 'preview', 'doing_wp_cron' );
+// Query string: cacha solo parametri esplicitamente sicuri (whitelist).
+// Tutto il resto (filtri WooCommerce, ricerca, ordinamento, ecc.) viene escluso
+// perché produce contenuto dinamico che varia per combinazione di parametri.
 if ( ! empty( $_GET ) ) {
-    foreach ( $excluded_params as $param ) {
-        if ( isset( $_GET[ $param ] ) ) {
-            header( 'X-OCM-Skip: excluded-param-' . $param );
-            return;
-        }
+    // Parametri ammessi: paginazione WordPress e lingua WPML/Polylang
+    $allowed_params = array( 'paged', 'page', 'lang', 'PHPSESSID' );
+    $query_keys     = array_keys( $_GET );
+    $unknown        = array_diff( $query_keys, $allowed_params );
+    if ( ! empty( $unknown ) ) {
+        header( 'X-OCM-Skip: query-string (' . implode( ',', array_map( 'sanitize_key', $unknown ) ) . ')' );
+        return;
     }
 }
 
