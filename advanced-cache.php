@@ -68,6 +68,16 @@ if ( ! empty( $_POST ) ) {
     return;
 }
 
+// No richieste AJAX/PJAX (Woodmart ajax_shop, WooCommerce fragments, ecc.)
+// Queste restituiscono HTML parziale, non pagine complete da cachare.
+if (
+    ( isset( $_SERVER['HTTP_X_REQUESTED_WITH'] ) && strtolower( $_SERVER['HTTP_X_REQUESTED_WITH'] ) === 'xmlhttprequest' ) ||
+    ! empty( $_SERVER['HTTP_X_PJAX'] )
+) {
+    header( 'X-OCM-Skip: ajax-pjax' );
+    return;
+}
+
 // No query string con parametri dinamici WooCommerce / WordPress
 $excluded_params = array( 'add-to-cart', 'remove_item', 'added-to-cart', 'wc-ajax', 'preview', 'doing_wp_cron' );
 if ( ! empty( $_GET ) ) {
