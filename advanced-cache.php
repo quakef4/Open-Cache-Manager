@@ -77,7 +77,7 @@ if ( ! empty( $_GET ) ) {
     $query_keys     = array_keys( $_GET );
     $unknown        = array_diff( $query_keys, $allowed_params );
     if ( ! empty( $unknown ) ) {
-        header( 'X-OCM-Skip: query-string (' . implode( ',', array_map( 'sanitize_key', $unknown ) ) . ')' );
+        header( 'X-OCM-Skip: query-string (' . implode( ',', array_map( function( $k ) { return preg_replace( '/[^a-z0-9_\-]/i', '', $k ); }, $unknown ) ) . ')' );
         return;
     }
 }
