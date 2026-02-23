@@ -4,8 +4,8 @@
  * Plugin URI:  https://github.com/quakef4/Open-Cache-Manager
  * Description: Cache manager per WordPress/WooCommerce con page cache gzip, ottimizzazione database e invalidazione intelligente per cataloghi di grandi dimensioni.
  * Version:     2.0.0
- * Author:      Starter Dev Labs
- * Author URI:  https://github.com/quakef4
+ * Author:      quakef4
+ * Author URI:  https://github.com/quakef4/Open-Cache-Manager
  * License:     GPL-2.0+
  * Text Domain: open-cache-manager
  *

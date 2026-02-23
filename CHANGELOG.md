@@ -8,7 +8,7 @@ Tutte le modifiche rilevanti al plugin sono documentate in questo file.
 
 ### Rinominazione e ristrutturazione
 - **Nuovo nome**: da "Infobit Page Cache" a **Open Cache Manager**
-- **Autore**: Starter Dev Labs
+- **Autore**: quakef4
 - **File principale**: `open-cache-manager.php` (era `infobit-page-cache.php`)
 - **Menu admin**: nuovo menu top-level "Cache Manager" con sottopagine
 - **Classe principale**: `Open_Cache_Manager` (era `Infobit_Page_Cache`)
