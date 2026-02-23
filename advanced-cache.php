@@ -217,11 +217,6 @@ function ocm_cache_output_callback( $html ) {
         return $html;
     }
 
-    // Non salvare pagine esplicitamente noindex
-    if ( preg_match( '/<meta[^>]+name=["\']robots["\'][^>]+content=["\'][^"\']*noindex/i', $html ) ) {
-        return $html;
-    }
-
     $cache_file = OCM_CACHE_FILE;
     $cache_dir  = dirname( $cache_file );
 
