@@ -156,9 +156,10 @@ class Open_Cache_Manager {
             add_option( 'open_cache_manager', $defaults );
         }
 
-        // Sincronizza URL esclusi
+        // Sincronizza URL esclusi e TTL con i file letti dal drop-in
         $options = get_option( 'open_cache_manager', $defaults );
         $this->sync_excluded_urls( isset( $options['excluded_urls'] ) ? $options['excluded_urls'] : '' );
+        $this->sync_ttl( isset( $options['ttl'] ) ? (int) $options['ttl'] : $this->default_ttl );
     }
 
     /**
@@ -707,6 +708,16 @@ class Open_Cache_Manager {
             wp_safe_redirect( $url ? $url : ( wp_get_referer() ? wp_get_referer() : admin_url() ) );
             exit;
         }
+
+        if ( isset( $_GET['action'] ) && $_GET['action'] === 'ocm_reinstall_dropin' ) {
+            if ( ! current_user_can( 'manage_options' ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'ocm_reinstall_dropin' ) ) {
+                wp_die( 'Non autorizzato' );
+            }
+            $this->activate();
+            set_transient( 'ocm_cache_notice', 'Reinstallazione completata. Controlla lo stato sistema per verificare il risultato.', 30 );
+            wp_safe_redirect( admin_url( 'admin.php?page=' . $this->options_page ) );
+            exit;
+        }
     }
 
     /**
@@ -718,6 +729,157 @@ class Open_Cache_Manager {
             printf( '<div class="notice notice-success is-dismissible"><p>%s</p></div>', wp_kses_post( $notice ) );
             delete_transient( 'ocm_cache_notice' );
         }
+    }
+
+    // =============================================================
+    //  DIAGNOSTICA SISTEMA
+    // =============================================================
+
+    /**
+     * Verifica lo stato di salute del sistema di cache.
+     *
+     * @return array Array di check con nome, stato (ok|warning|error) e messaggio.
+     */
+    public function get_system_health() {
+        $checks = array();
+
+        // 1. WP_CACHE in wp-config.php
+        if ( defined( 'WP_CACHE' ) && WP_CACHE ) {
+            $checks[] = array(
+                'label'  => 'WP_CACHE in wp-config.php',
+                'status' => 'ok',
+                'note'   => 'Definito come <code>true</code>',
+            );
+        } else {
+            $checks[] = array(
+                'label'  => 'WP_CACHE in wp-config.php',
+                'status' => 'error',
+                'note'   => 'Non definito o <code>false</code>. Il drop-in <strong>non viene caricato</strong>. Clicca "Reinstalla" per aggiungerlo.',
+            );
+        }
+
+        // 2. advanced-cache.php installato
+        $dropin_path = WP_CONTENT_DIR . '/advanced-cache.php';
+        if ( file_exists( $dropin_path ) ) {
+            $dropin_content = @file_get_contents( $dropin_path );
+            if ( $dropin_content !== false && strpos( $dropin_content, 'Open Cache Manager' ) !== false ) {
+                $checks[] = array(
+                    'label'  => 'Drop-in advanced-cache.php',
+                    'status' => 'ok',
+                    'note'   => 'Installato correttamente in <code>wp-content/</code>',
+                );
+            } else {
+                $checks[] = array(
+                    'label'  => 'Drop-in advanced-cache.php',
+                    'status' => 'warning',
+                    'note'   => 'Esiste ma appartiene a un altro plugin. Non verrà sovrascritto.',
+                );
+            }
+        } else {
+            $checks[] = array(
+                'label'  => 'Drop-in advanced-cache.php',
+                'status' => 'error',
+                'note'   => 'Non trovato in <code>wp-content/</code>. Clicca "Reinstalla".',
+            );
+        }
+
+        // 3. File .active
+        $active_file = $this->cache_dir . '.active';
+        if ( file_exists( $active_file ) ) {
+            $active_content = trim( @file_get_contents( $active_file ) );
+            if ( $active_content && file_exists( $active_content . 'open-cache-manager.php' ) ) {
+                $checks[] = array(
+                    'label'  => 'Flag attivazione (.active)',
+                    'status' => 'ok',
+                    'note'   => 'Presente. Path plugin: <code>' . esc_html( $active_content ) . '</code>',
+                );
+            } else {
+                $checks[] = array(
+                    'label'  => 'Flag attivazione (.active)',
+                    'status' => 'error',
+                    'note'   => 'File presente ma il path del plugin non è valido (<code>' . esc_html( $active_content ) . '</code>). Clicca "Reinstalla".',
+                );
+            }
+        } else {
+            $checks[] = array(
+                'label'  => 'Flag attivazione (.active)',
+                'status' => 'error',
+                'note'   => 'Non trovato in <code>' . esc_html( $this->cache_dir ) . '</code>. Clicca "Reinstalla".',
+            );
+        }
+
+        // 4. Directory cache scrivibile
+        if ( is_dir( $this->cache_dir ) && is_writable( $this->cache_dir ) ) {
+            $checks[] = array(
+                'label'  => 'Directory cache',
+                'status' => 'ok',
+                'note'   => '<code>' . esc_html( $this->cache_dir ) . '</code> — scrivibile',
+            );
+        } elseif ( is_dir( $this->cache_dir ) ) {
+            $checks[] = array(
+                'label'  => 'Directory cache',
+                'status' => 'error',
+                'note'   => '<code>' . esc_html( $this->cache_dir ) . '</code> — <strong>non scrivibile</strong>. I file .gz non possono essere creati.',
+            );
+        } else {
+            $checks[] = array(
+                'label'  => 'Directory cache',
+                'status' => 'warning',
+                'note'   => '<code>' . esc_html( $this->cache_dir ) . '</code> — non esiste ancora. Verrà creata al primo salvataggio.',
+            );
+        }
+
+        // 5. wp-content scrivibile (per advanced-cache.php)
+        if ( is_writable( WP_CONTENT_DIR ) ) {
+            $checks[] = array(
+                'label'  => 'wp-content/ scrivibile',
+                'status' => 'ok',
+                'note'   => 'Il drop-in può essere installato/aggiornato automaticamente',
+            );
+        } else {
+            $checks[] = array(
+                'label'  => 'wp-content/ scrivibile',
+                'status' => 'warning',
+                'note'   => '<strong>Non scrivibile.</strong> Il drop-in deve essere copiato manualmente da <code>' . esc_html( OCM_PLUGIN_DIR ) . 'advanced-cache.php</code> a <code>' . esc_html( WP_CONTENT_DIR ) . '/advanced-cache.php</code>',
+            );
+        }
+
+        // 6. wp-config.php scrivibile
+        $config_file = ABSPATH . 'wp-config.php';
+        if ( ! file_exists( $config_file ) ) {
+            $config_file = dirname( ABSPATH ) . '/wp-config.php';
+        }
+        if ( file_exists( $config_file ) && is_writable( $config_file ) ) {
+            $checks[] = array(
+                'label'  => 'wp-config.php scrivibile',
+                'status' => 'ok',
+                'note'   => 'WP_CACHE può essere aggiunto/rimosso automaticamente',
+            );
+        } else {
+            $checks[] = array(
+                'label'  => 'wp-config.php scrivibile',
+                'status' => 'warning',
+                'note'   => '<strong>Non scrivibile.</strong> Aggiungi manualmente in cima a wp-config.php: <code>define( \'WP_CACHE\', true ); // Open Cache Manager</code>',
+            );
+        }
+
+        // 7. Cron schedulato
+        $next_cron = wp_next_scheduled( 'ocm_cache_cleanup' );
+        if ( $next_cron ) {
+            $checks[] = array(
+                'label'  => 'Cron pulizia automatica',
+                'status' => 'ok',
+                'note'   => 'Schedulato — prossima esecuzione: ' . esc_html( date( 'd/m/Y H:i:s', $next_cron ) ),
+            );
+        } else {
+            $checks[] = array(
+                'label'  => 'Cron pulizia automatica',
+                'status' => 'warning',
+                'note'   => 'Non schedulato. Clicca "Reinstalla" per ripristinarlo.',
+            );
+        }
+
+        return $checks;
     }
 
     // =============================================================
@@ -774,6 +936,7 @@ class Open_Cache_Manager {
             );
             update_option( 'open_cache_manager', $options );
             $this->sync_excluded_urls( $options['excluded_urls'] );
+            $this->sync_ttl( $options['ttl'] );
             echo '<div class="notice notice-success"><p>Impostazioni salvate!</p></div>';
         }
 
@@ -784,11 +947,54 @@ class Open_Cache_Manager {
             'bulk_threshold' => 50,
         ) );
 
-        $stats = $this->get_stats();
+        $stats  = $this->get_stats();
+        $health = $this->get_system_health();
+
+        // Conta errori per decidere se mostrare l'avviso
+        $has_errors = false;
+        foreach ( $health as $check ) {
+            if ( $check['status'] === 'error' ) {
+                $has_errors = true;
+                break;
+            }
+        }
         ?>
         <div class="wrap">
             <h1>Open Cache Manager - Page Cache</h1>
             <p class="description">v<?php echo esc_html( OCM_VERSION ); ?> | Cache file gzip per WordPress/WooCommerce</p>
+
+            <!-- Stato sistema -->
+            <div class="card" style="max-width:700px; padding:15px; margin-bottom:20px; <?php echo $has_errors ? 'border-left: 4px solid #d63638;' : 'border-left: 4px solid #00a32a;'; ?>">
+                <h2 style="margin-top:0;">Stato sistema</h2>
+                <table class="widefat" style="margin-bottom:12px;">
+                    <thead>
+                        <tr>
+                            <th style="width:220px;">Componente</th>
+                            <th style="width:60px;">Stato</th>
+                            <th>Dettaglio</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach ( $health as $check ) :
+                        $icon = $check['status'] === 'ok' ? '&#10003;' : ( $check['status'] === 'error' ? '&#10007;' : '&#9888;' );
+                        $color = $check['status'] === 'ok' ? '#00a32a' : ( $check['status'] === 'error' ? '#d63638' : '#dba617' );
+                    ?>
+                        <tr>
+                            <td><?php echo esc_html( $check['label'] ); ?></td>
+                            <td style="text-align:center; color:<?php echo $color; ?>; font-size:18px; font-weight:bold;"><?php echo $icon; ?></td>
+                            <td><small><?php echo wp_kses( $check['note'], array( 'code' => array(), 'strong' => array() ) ); ?></small></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+                <a href="<?php echo wp_nonce_url( admin_url( 'admin.php?action=ocm_reinstall_dropin' ), 'ocm_reinstall_dropin' ); ?>"
+                   class="button <?php echo $has_errors ? 'button-primary' : 'button-secondary'; ?>">
+                    &#8635; Reinstalla drop-in e ripristina impostazioni
+                </a>
+                <p style="margin-top:8px; color:#646970; font-size:12px;">
+                    Riesegue tutti i passi di attivazione: copia advanced-cache.php, scrive WP_CACHE in wp-config.php, ricrea il file .active, schedula il cron.
+                </p>
+            </div>
 
             <!-- Statistiche -->
             <div class="card" style="max-width:600px; padding:15px; margin-bottom:20px;">
@@ -1109,6 +1315,18 @@ do_action( 'ocm_cache_invalidate_all' );
 
         $lines = array_filter( array_map( 'trim', explode( "\n", $excluded_urls ) ) );
         file_put_contents( $file, implode( "\n", $lines ), LOCK_EX );
+    }
+
+    /**
+     * Scrive il file .ttl letto dal drop-in (non ha accesso al DB).
+     *
+     * @param int $ttl Durata in secondi.
+     */
+    private function sync_ttl( $ttl ) {
+        if ( ! is_dir( $this->cache_dir ) ) {
+            mkdir( $this->cache_dir, 0755, true );
+        }
+        file_put_contents( $this->cache_dir . '.ttl', (int) $ttl, LOCK_EX );
     }
 
     private function get_current_url() {

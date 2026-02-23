@@ -1,0 +1,41 @@
+name: Build Release ZIP
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create plugin ZIP
+        run: |
+          PLUGIN_SLUG="Open-Cache-Manager"
+          TMP_DIR="/tmp/${PLUGIN_SLUG}"
+          ZIP_FILE="/tmp/${PLUGIN_SLUG}.zip"
+
+          mkdir -p "${TMP_DIR}"
+
+          # Copia solo i file del plugin (escludi .git, .github, CLAUDE.md)
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='CLAUDE.md' \
+            --exclude='*.zip' \
+            . "${TMP_DIR}/"
+
+          cd /tmp
+          zip -r "${ZIP_FILE}" "${PLUGIN_SLUG}/"
+
+          echo "ZIP creato: $(du -sh ${ZIP_FILE} | cut -f1)"
+
+      - name: Upload ZIP to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: /tmp/Open-Cache-Manager.zip

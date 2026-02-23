@@ -7,6 +7,12 @@
  *
  * Va copiato in: wp-content/advanced-cache.php
  *
+ * Diagnostica: ogni richiesta riceve uno di questi header HTTP:
+ *   X-OCM-Loaded: 1              → drop-in caricato correttamente
+ *   X-OCM-Skip: {motivo}         → drop-in attivo ma ha saltato questa richiesta
+ *   X-OCM-Cache: HIT             → pagina servita dalla cache
+ *   X-OCM-Cache: MISS            → pagina non in cache, verrà salvata
+ *
  * @package Open_Cache_Manager
  * @version 2.0.0
  */
@@ -15,17 +21,24 @@ if ( ! defined( 'ABSPATH' ) ) {
     return;
 }
 
+// Il drop-in è caricato: invia subito l'header diagnostico.
+// Visibile in DevTools → Network → Headers su qualsiasi richiesta.
+header( 'X-OCM-Loaded: 1' );
+
 // ============================================================
 // CONTROLLO DI SICUREZZA
 // ============================================================
+
 $active_flag = WP_CONTENT_DIR . '/cache/ocm-pages/.active';
 if ( ! file_exists( $active_flag ) ) {
+    header( 'X-OCM-Skip: no-active-flag' );
     return;
 }
 
 // Il file .active contiene il path reale del plugin (indipendente dal nome cartella)
 $ocm_plugin_dir = trim( @file_get_contents( $active_flag ) );
 if ( ! $ocm_plugin_dir || ! file_exists( $ocm_plugin_dir . 'open-cache-manager.php' ) ) {
+    header( 'X-OCM-Skip: plugin-not-found (' . $ocm_plugin_dir . ')' );
     return;
 }
 
@@ -33,8 +46,11 @@ if ( ! $ocm_plugin_dir || ! file_exists( $ocm_plugin_dir . 'open-cache-manager.p
 // CONFIGURAZIONE
 // ============================================================
 define( 'OCM_CACHE_DIR', WP_CONTENT_DIR . '/cache/ocm-pages/' );
-define( 'OCM_CACHE_TTL', 3600 );
-define( 'OCM_CACHE_DEBUG', false );
+define( 'OCM_CACHE_DEBUG', defined( 'OCM_DEBUG' ) && OCM_DEBUG );
+
+// Leggi TTL dal file di configurazione se esiste, altrimenti usa il default
+$ocm_ttl_file = OCM_CACHE_DIR . '.ttl';
+define( 'OCM_CACHE_TTL', ( file_exists( $ocm_ttl_file ) ? (int) file_get_contents( $ocm_ttl_file ) : 3600 ) );
 
 // ============================================================
 // CONDIZIONI DI ESCLUSIONE
@@ -42,24 +58,32 @@ define( 'OCM_CACHE_DEBUG', false );
 
 // Solo richieste GET
 if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || $_SERVER['REQUEST_METHOD'] !== 'GET' ) {
+    header( 'X-OCM-Skip: not-get' );
     return;
 }
 
-// No query string con parametri dinamici WooCommerce
-$excluded_params = array( 'add-to-cart', 'remove_item', 'added-to-cart', 'wc-ajax', 'preview' );
+// No richieste POST con dati
+if ( ! empty( $_POST ) ) {
+    header( 'X-OCM-Skip: post-data' );
+    return;
+}
+
+// No query string con parametri dinamici WooCommerce / WordPress
+$excluded_params = array( 'add-to-cart', 'remove_item', 'added-to-cart', 'wc-ajax', 'preview', 'doing_wp_cron' );
 if ( ! empty( $_GET ) ) {
     foreach ( $excluded_params as $param ) {
         if ( isset( $_GET[ $param ] ) ) {
+            header( 'X-OCM-Skip: excluded-param-' . $param );
             return;
         }
     }
 }
 
 // Gestione utenti loggati:
-// - Admin/editor/shop_manager (hanno cookie wp-settings-*) → NO cache
-// - Clienti (hanno solo wordpress_logged_in_*) → cache OK su catalogo
+// - Admin/editor/shop_manager (hanno cookie wp-settings-time-*) → NO cache
+// - Clienti WooCommerce (solo wordpress_logged_in_*) → cache OK sul catalogo
 if ( ! empty( $_COOKIE ) ) {
-    $is_logged_in = false;
+    $is_logged_in  = false;
     $is_admin_user = false;
 
     foreach ( $_COOKIE as $cookie_name => $cookie_value ) {
@@ -71,24 +95,20 @@ if ( ! empty( $_COOKIE ) ) {
         }
     }
 
-    // Admin/editor → no cache mai
     if ( $is_logged_in && $is_admin_user ) {
+        header( 'X-OCM-Skip: admin-user' );
         return;
     }
 }
 
 // No carrello WooCommerce attivo
 if ( ! empty( $_COOKIE['woocommerce_items_in_cart'] ) && $_COOKIE['woocommerce_items_in_cart'] !== '0' ) {
+    header( 'X-OCM-Skip: cart-active' );
     return;
 }
 
-// No richieste POST
-if ( ! empty( $_POST ) ) {
-    return;
-}
-
-// URL esclusi
-$request_uri = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '';
+// URL esclusi (hardcoded)
+$request_uri    = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '/';
 $excluded_paths = array(
     '/wp-admin',
     '/wp-login',
@@ -112,8 +132,8 @@ $excluded_paths = array(
     '/oembed',
 );
 
-// Leggi esclusioni custom da file
-$custom_excluded_file = WP_CONTENT_DIR . '/cache/ocm-pages/.excluded_urls';
+// URL esclusi custom da file (scritto dal plugin principale)
+$custom_excluded_file = OCM_CACHE_DIR . '.excluded_urls';
 if ( file_exists( $custom_excluded_file ) ) {
     $custom_excluded = file( $custom_excluded_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
     if ( is_array( $custom_excluded ) ) {
@@ -121,31 +141,32 @@ if ( file_exists( $custom_excluded_file ) ) {
     }
 }
 
-$uri_path = strtolower( parse_url( $request_uri, PHP_URL_PATH ) );
+$uri_path = strtolower( (string) parse_url( $request_uri, PHP_URL_PATH ) );
 foreach ( $excluded_paths as $excluded ) {
-    if ( strpos( $uri_path, $excluded ) !== false ) {
+    if ( $excluded !== '' && strpos( $uri_path, strtolower( $excluded ) ) !== false ) {
+        header( 'X-OCM-Skip: excluded-url' );
         return;
     }
 }
 
 // ============================================================
-// GESTIONE CACHE (SOLO GZIP)
+// GESTIONE CACHE
 // ============================================================
 
 $cache_host = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : 'localhost';
 $cache_key  = md5( $cache_host . $request_uri );
-$cache_file = OCM_CACHE_DIR . substr( $cache_key, 0, 2 ) . '/' . $cache_key . '.gz';
+$cache_sub  = substr( $cache_key, 0, 2 );
+$cache_file = OCM_CACHE_DIR . $cache_sub . '/' . $cache_key . '.gz';
 
-// Controlla se esiste una versione cached valida
+// HIT: serve il file dalla cache se valido
 if ( file_exists( $cache_file ) ) {
     $file_age = time() - filemtime( $cache_file );
 
     if ( $file_age < OCM_CACHE_TTL ) {
         header( 'X-OCM-Cache: HIT' );
-        header( 'X-OCM-Cache-Age: ' . $file_age );
+        header( 'X-OCM-Cache-Age: ' . $file_age . 's' );
         header( 'Content-Type: text/html; charset=UTF-8' );
 
-        // Verifica se il client accetta gzip
         $accepts_gzip = isset( $_SERVER['HTTP_ACCEPT_ENCODING'] )
             && strpos( $_SERVER['HTTP_ACCEPT_ENCODING'], 'gzip' ) !== false;
 
@@ -154,69 +175,77 @@ if ( file_exists( $cache_file ) ) {
             header( 'Vary: Accept-Encoding' );
             readfile( $cache_file );
         } else {
-            // Fallback: decomprime al volo per client senza gzip
-            $gz_content = file_get_contents( $cache_file );
-            if ( $gz_content !== false ) {
-                echo gzdecode( $gz_content );
+            $gz = file_get_contents( $cache_file );
+            if ( $gz !== false ) {
+                echo gzdecode( $gz );
             }
         }
         exit;
     }
+
+    // File scaduto: elimina e rigenera
+    @unlink( $cache_file );
 }
 
-// Cache MISS: cattura l'output e salvalo
+// MISS: cattura l'output per salvarlo
 header( 'X-OCM-Cache: MISS' );
+
+// Passa il path del file alla callback tramite costante (più affidabile di $GLOBALS)
+define( 'OCM_CACHE_FILE', $cache_file );
 
 /**
  * Callback di output buffering.
- * Salva l'HTML generato nella cache come file gzip.
+ * Salva l'HTML generato come file gzip nella cache.
  *
- * @param string $html L'output HTML della pagina.
- * @return string L'HTML inalterato.
+ * @param string $html L'output HTML completo della pagina.
+ * @return string L'HTML inalterato (non modifichiamo l'output per il browser).
  */
 function ocm_cache_output_callback( $html ) {
 
-    // Non cachare pagine troppo corte (errori, redirect)
-    if ( strlen( $html ) < 1000 ) {
+    // Non salvare pagine troppo corte (probabile redirect o errore)
+    if ( strlen( $html ) < 500 ) {
         return $html;
     }
 
-    // Non cachare risposte non-200
-    if ( http_response_code() !== 200 ) {
+    // Non salvare se non sembra HTML valido
+    if ( stripos( $html, '<html' ) === false && stripos( $html, '<!DOCTYPE' ) === false ) {
         return $html;
     }
 
-    // Non cachare pagine con errori WooCommerce
+    // Non salvare pagine con messaggi di errore WooCommerce visibili
     if ( strpos( $html, 'woocommerce-error' ) !== false ) {
         return $html;
     }
 
-    // Non cachare pagine noindex
-    if ( strpos( $html, '<meta name="robots"' ) !== false && strpos( $html, 'noindex' ) !== false ) {
+    // Non salvare pagine esplicitamente noindex
+    if ( preg_match( '/<meta[^>]+name=["\']robots["\'][^>]+content=["\'][^"\']*noindex/i', $html ) ) {
         return $html;
     }
 
-    $cache_file = $GLOBALS['ocm_cache_file'];
+    $cache_file = OCM_CACHE_FILE;
     $cache_dir  = dirname( $cache_file );
 
+    // Crea la sottodirectory se non esiste
     if ( ! is_dir( $cache_dir ) ) {
-        mkdir( $cache_dir, 0755, true );
+        if ( ! @mkdir( $cache_dir, 0755, true ) ) {
+            return $html; // Non si può creare la directory, salta
+        }
     }
 
+    // Aggiungi commento debug se abilitato (define OCM_DEBUG true in wp-config.php)
     if ( OCM_CACHE_DEBUG ) {
-        $html .= "\n<!-- Open Cache Manager | Cached: " . date( 'Y-m-d H:i:s' ) . " -->";
+        $html = rtrim( $html ) . "\n<!-- OCM cached: " . gmdate( 'Y-m-d H:i:s' ) . " UTC -->\n";
     }
 
-    // Comprimi e salva solo il gzip
+    // Comprimi e salva con scrittura atomica (tmp → rename)
     if ( function_exists( 'gzencode' ) ) {
-        $gzip_content = gzencode( $html, 6 );
-        if ( $gzip_content !== false ) {
-            // Scrittura atomica (tmp + rename)
-            $tmp_file = $cache_file . '.tmp.' . getmypid();
-            if ( file_put_contents( $tmp_file, $gzip_content, LOCK_EX ) !== false ) {
-                rename( $tmp_file, $cache_file );
+        $compressed = gzencode( $html, 6 );
+        if ( $compressed !== false ) {
+            $tmp = $cache_file . '.tmp.' . getmypid();
+            if ( @file_put_contents( $tmp, $compressed, LOCK_EX ) !== false ) {
+                @rename( $tmp, $cache_file );
             } else {
-                @unlink( $tmp_file );
+                @unlink( $tmp );
             }
         }
     }
@@ -224,5 +253,4 @@ function ocm_cache_output_callback( $html ) {
     return $html;
 }
 
-$GLOBALS['ocm_cache_file'] = $cache_file;
 ob_start( 'ocm_cache_output_callback' );
