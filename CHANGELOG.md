@@ -4,6 +4,57 @@ Tutte le modifiche rilevanti al plugin sono documentate in questo file.
 
 ---
 
+## [2.1.3] - 2026-03-09
+
+### Fix
+- **REGEN stampede dopo clear_all()**: dopo lo svuotamento cache, ogni pagina stale (1000+) lanciava un boot completo di WordPress in parallelo, saturando CPU e RAM del server. Aggiunto limite globale di concorrenza: max 3 processi REGEN attivi contemporaneamente, tutti gli altri servono stale content (zero lag). Contatore atomico con `flock()`, shutdown function di sicurezza, auto-reset dopo 5 minuti nel cron
+- **Dedup `.url_index` nel drop-in leggeva tutto il file ad ogni REGEN**: il check anti-duplicati aggiunto in v2.1.2 faceva `file_get_contents()` dell'intero indice ad ogni salvataggio cache. Dopo un clear_all con 1000 pagine stale, questo causava I/O cumulativo O(N²) (~50MB). Rimosso il check dal hot path: i duplicati vengono puliti dal cron (`cleanup_url_index`)
+- **`clear_all()` iterava tutta la directory**: scansionava ricorsivamente tutte le sottodirectory solo per contare i file .gz prima del soft purge. Con 1000+ file, aggiungeva latenza inutile all'operazione di svuotamento
+
+### Migliorato
+- `clear_all()` resetta il contatore REGEN globale per evitare stale counter dopo invalidazione
+- `cleanup_expired()` resetta `.regen_count` se bloccato da > 5 minuti
+- `ocm_cleanup_lock()` è ora idempotente (safe per doppia chiamata da callback + shutdown)
+- Messaggi admin aggiornati: "Cache invalidata! Le pagine verranno rigenerate gradualmente"
+
+---
+
+## [2.1.2] - 2026-03-09
+
+### Fix
+- **Lag durante bulk sotto soglia (O(N*M) → O(N+M))**: `bulk_end()` sotto soglia chiamava `invalidate_product_cache()` per ogni prodotto, che a sua volta chiamava `invalidate_url()` 3-5 volte ciascuna, ognuna leggendo l'intero `.url_index` da disco. Con 40 prodotti × 5 URL × 4.441 righe = ~888.000 operazioni I/O. Ora `batch_invalidate_products()` carica l'indice una sola volta e scansiona le varianti in un singolo passaggio
+- **`.url_index` cresceva con duplicati**: il drop-in aggiungeva una riga ad ogni MISS/REGEN senza verificare se l'URL era già indicizzato. Dopo soft purge (clear_all) + rigenerazione, ogni pagina veniva re-aggiunta creando duplicati (4.441 righe per 1.008 pagine). Aggiunto controllo hash prima dell'append
+- **`.url_index` mai pulito**: le voci di file cache cancellati (per TTL o invalidazione) restavano nell'indice per sempre. Aggiunto `cleanup_url_index()` al cron che rimuove duplicati e voci orfane (file .gz assente)
+
+### Migliorato
+- `load_url_index()` con cache in memoria: l'indice viene letto da disco una sola volta per richiesta PHP
+- `invalidate_by_prefix()` accetta indice pre-caricato come parametro per evitare letture ripetute
+
+---
+
+## [2.1.1] - 2026-03-09
+
+### Fix
+- **Contatore cache non si resettava**: il pulsante "Svuota tutta la cache" faceva un redirect dopo la cancellazione; nel tempo tra il clear e il ricaricamento della pagina i visitatori ri-cachavano le pagine, mostrando un conteggio non azzerato. Convertito a AJAX con aggiornamento immediato delle statistiche nel DOM
+- **File .ttl cancellato durante lo svuotamento**: `clear_all()` e `cleanup_expired()` non proteggevano il file `.ttl`, resettando il TTL al valore di default (3600s) dopo ogni svuotamento
+- **Sito lento dopo svuotamento cache (thundering herd)**: dopo `clear_all()` ogni visitatore riceveva un MISS e WordPress doveva rigenerare la pagina da zero, causando lag per tutti i visitatori contemporanei. Implementato **stale-while-revalidate**: `clear_all()` ora fa un soft purge (marca i file come invalidi tramite `.invalidated_at` senza cancellarli). Il drop-in serve il contenuto stale (veloce!) ai visitatori mentre un solo processo alla volta rigenera la pagina fresca. Lock atomici prevengono il thundering herd. Warm-up automatico per homepage e shop
+- **Bulk mode: 20.000 query DB per import massivi**: `invalidate_product_cache()` faceva `get_transient()` + `set_transient()` per ogni singolo prodotto durante il bulk. Con 10.000 prodotti = 20.000 query. Ora gli ID vengono accumulati in una proprietà di istanza (`$bulk_pending_ids`) e processati solo in `bulk_end()`
+- **Race condition bulk senza bulk_end()**: se lo script terminava per fatal error o timeout durante un import bulk, gli ID accumulati restavano in un transient orfano per 1 ora senza essere mai processati. Aggiunto `register_shutdown_function()` come fallback di sicurezza
+- **Pagine filtrate non invalidate**: quando un prodotto cambiava, le varianti filtrate delle pagine (es. `/shop/?orderby=price`, `/product-category/scarpe/?min_price=10`) restavano in cache con dati vecchi fino al TTL. Aggiunto indice URL (`.url_index`) mantenuto dal drop-in e invalidazione per prefisso path nel plugin
+
+### Migliorato
+- Pulsante "Svuota tutta la cache" nella pagina impostazioni ora usa AJAX con spinner e notifica inline
+- Aggiunto `clearstatcache(true)` dopo la cancellazione per garantire letture filesystem aggiornate
+- Il contatore nella admin bar si aggiorna automaticamente dopo lo svuotamento AJAX
+- I file protetti nella directory cache (`.active`, `.excluded_urls`, `.ttl`) ora usano un array centralizzato
+- Nuovo check nello "Stato sistema": Indice URL con conteggio URL indicizzati
+- `get_stats()` ora esclude i file stale (invalidati) dal conteggio
+- `cleanup_expired()` ora pulisce anche lock file e tmp file orfani (> 60s), e rimuove il marker `.invalidated_at` quando tutti i file stale sono stati rigenerati
+- Header diagnostico `X-OCM-Cache: STALE` per distinguere le risposte stale da HIT/MISS
+- Header diagnostico `X-OCM-Cache: REGEN` per il processo che sta rigenerando una pagina
+
+---
+
 ## [2.0.0] - 2026-02-21
 
 ### Rinominazione e ristrutturazione

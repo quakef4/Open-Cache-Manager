@@ -1,4 +1,4 @@
-# Open Cache Manager v2.0.0
+# Open Cache Manager v2.1.3
 
 Plugin WordPress di cache management ottimizzato per WooCommerce con cataloghi di grandi dimensioni (45.000+ prodotti).
 

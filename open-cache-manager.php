@@ -3,7 +3,7 @@
  * Plugin Name: Open Cache Manager
  * Plugin URI:  https://github.com/quakef4/Open-Cache-Manager
  * Description: Cache manager per WordPress/WooCommerce con page cache gzip, ottimizzazione database e invalidazione intelligente per cataloghi di grandi dimensioni.
- * Version:     2.0.0
+ * Version:     2.1.3
  * Author:      quakef4
  * Author URI:  https://github.com/quakef4/Open-Cache-Manager
  * License:     GPL-2.0+
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OCM_VERSION', '2.0.0' );
+define( 'OCM_VERSION', '2.1.3' );
 define( 'OCM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'OCM_PLUGIN_FILE', __FILE__ );
 
@@ -49,6 +49,21 @@ class Open_Cache_Manager {
      * @var bool
      */
     private $bulk_mode = false;
+
+    /**
+     * ID prodotti accumulati durante la modalità bulk (in memoria).
+     * Evita di scrivere un transient per ogni singolo prodotto.
+     *
+     * @var array
+     */
+    private $bulk_pending_ids = array();
+
+    /**
+     * Cache in memoria dell'indice URL (caricato una volta per richiesta).
+     *
+     * @var array|null
+     */
+    private $url_index_cache = null;
 
     /**
      * Costruttore.
@@ -84,6 +99,9 @@ class Open_Cache_Manager {
         add_action( 'admin_init',      array( $this, 'handle_admin_actions' ) );
         add_action( 'admin_menu',      array( $this, 'add_admin_menu' ) );
         add_action( 'admin_notices',   array( $this, 'admin_notices' ) );
+
+        // AJAX handler per svuotamento cache dalla pagina impostazioni.
+        add_action( 'wp_ajax_ocm_ajax_clear_cache', array( $this, 'ajax_clear_cache' ) );
 
         // -------------------------------------------------------
         // Azione custom per invalidazione bulk
@@ -192,8 +210,8 @@ class Open_Cache_Manager {
         // STEP 4: rimuovi cron
         wp_clear_scheduled_hook( 'ocm_cache_cleanup' );
 
-        // STEP 5: svuota cache
-        $this->clear_all();
+        // STEP 5: svuota cache (hard: cancella file fisicamente)
+        $this->hard_clear_all();
 
         // STEP 6: rimuovi directory cache
         $this->remove_cache_directory();
@@ -416,12 +434,88 @@ class Open_Cache_Manager {
         $path   = isset( $parsed['path'] ) ? $parsed['path'] : '/';
         $query  = isset( $parsed['query'] ) ? '?' . $parsed['query'] : '';
 
+        // Invalida la versione esatta dell'URL.
         $cache_key  = md5( $host . $path . $query );
         $cache_file = $this->cache_dir . substr( $cache_key, 0, 2 ) . '/' . $cache_key . '.gz';
 
         if ( file_exists( $cache_file ) ) {
             @unlink( $cache_file );
         }
+
+        // Invalida anche tutte le varianti filtrate/ordinate di questo URL.
+        // Il drop-in usa md5( host + request_uri ) dove request_uri include la query string.
+        // Pagine come /shop/?orderby=price o /product-category/scarpe/?min_price=10
+        // non vengono invalidate dal solo hash esatto sopra.
+        $this->invalidate_by_prefix( $host, $path );
+    }
+
+    /**
+     * Invalida tutti i file cache il cui URL inizia con un determinato path.
+     * Usa l'indice URL se disponibile.
+     *
+     * @param string $host Hostname del sito.
+     * @param string $path Path URL (es. /shop/, /product-category/scarpe/).
+     * @param array|null $index Indice URL pre-caricato (per evitare letture ripetute in batch).
+     */
+    private function invalidate_by_prefix( $host, $path, $index = null ) {
+        if ( null === $index ) {
+            $index = $this->load_url_index();
+        }
+
+        if ( empty( $index ) ) {
+            return;
+        }
+
+        foreach ( $index as $line ) {
+            // Formato: hash|host|request_uri
+            $parts = explode( '|', $line, 3 );
+            if ( count( $parts ) !== 3 ) {
+                continue;
+            }
+
+            list( $hash, $stored_host, $stored_uri ) = $parts;
+
+            if ( $stored_host !== $host ) {
+                continue;
+            }
+
+            // Controlla se l'URI inizia con il path (copre ?query variants).
+            $stored_path = (string) parse_url( $stored_uri, PHP_URL_PATH );
+            if ( $stored_path === $path ) {
+                $cache_file = $this->cache_dir . substr( $hash, 0, 2 ) . '/' . $hash . '.gz';
+                if ( file_exists( $cache_file ) ) {
+                    @unlink( $cache_file );
+                }
+            }
+        }
+    }
+
+    /**
+     * Carica l'indice URL dalla cache. Risultato memorizzato per la durata della richiesta.
+     *
+     * @return array Righe dell'indice URL.
+     */
+    private function load_url_index() {
+        if ( null !== $this->url_index_cache ) {
+            return $this->url_index_cache;
+        }
+
+        $index_file = $this->cache_dir . '.url_index';
+        if ( ! file_exists( $index_file ) ) {
+            $this->url_index_cache = array();
+            return $this->url_index_cache;
+        }
+
+        $index = @file( $index_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+        $this->url_index_cache = is_array( $index ) ? $index : array();
+        return $this->url_index_cache;
+    }
+
+    /**
+     * Resetta la cache in memoria dell'indice URL (dopo invalidazioni che lo modificano).
+     */
+    private function reset_url_index_cache() {
+        $this->url_index_cache = null;
     }
 
     /**
@@ -431,12 +525,7 @@ class Open_Cache_Manager {
      */
     public function invalidate_product_cache( $product_id ) {
         if ( $this->bulk_mode ) {
-            $pending = get_transient( 'ocm_cache_bulk_ids' );
-            if ( ! is_array( $pending ) ) {
-                $pending = array();
-            }
-            $pending[] = $product_id;
-            set_transient( 'ocm_cache_bulk_ids', $pending, HOUR_IN_SECONDS );
+            $this->bulk_pending_ids[] = $product_id;
             return;
         }
 
@@ -507,15 +596,26 @@ class Open_Cache_Manager {
     // =============================================================
 
     public function bulk_start() {
-        $this->bulk_mode = true;
-        set_transient( 'ocm_cache_bulk_ids', array(), HOUR_IN_SECONDS );
+        $this->bulk_mode       = true;
+        $this->bulk_pending_ids = array();
+
+        // Shutdown hook di sicurezza: se lo script termina senza chiamare
+        // bulk_end() (fatal error, timeout, ecc.) processa comunque gli ID
+        // accumulati per non lasciare la cache in uno stato inconsistente.
+        register_shutdown_function( array( $this, 'bulk_end' ) );
     }
 
     public function bulk_end() {
-        $this->bulk_mode = false;
-        $pending = get_transient( 'ocm_cache_bulk_ids' );
+        // Evita doppia esecuzione (chiamata esplicita + shutdown hook).
+        if ( ! $this->bulk_mode && empty( $this->bulk_pending_ids ) ) {
+            return;
+        }
 
-        if ( ! is_array( $pending ) || empty( $pending ) ) {
+        $this->bulk_mode = false;
+        $pending = $this->bulk_pending_ids;
+        $this->bulk_pending_ids = array();
+
+        if ( empty( $pending ) ) {
             return;
         }
 
@@ -525,13 +625,101 @@ class Open_Cache_Manager {
         $unique_ids = array_unique( $pending );
         if ( count( $unique_ids ) > $threshold ) {
             $this->clear_all();
+            $this->warm_critical_pages();
         } else {
-            foreach ( $unique_ids as $product_id ) {
-                $this->invalidate_product_cache( $product_id );
+            $this->batch_invalidate_products( $unique_ids );
+        }
+    }
+
+    /**
+     * Invalida la cache per un batch di prodotti in modo efficiente.
+     * Carica l'indice URL una sola volta e lo riusa per tutte le invalidazioni,
+     * evitando letture ripetute del file (O(N*M) → O(N+M)).
+     *
+     * @param array $product_ids Array di ID prodotti da invalidare.
+     */
+    private function batch_invalidate_products( $product_ids ) {
+        // Carica l'indice URL una volta sola in memoria.
+        $index = $this->load_url_index();
+
+        // Raccogli tutti i path da invalidare (con deduplicazione).
+        $paths_to_invalidate = array();
+        $files_to_delete     = array();
+        $host                = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : parse_url( home_url(), PHP_URL_HOST );
+
+        // Homepage e shop sono comuni a tutti i prodotti: aggiungi una volta sola.
+        $home_path = parse_url( home_url( '/' ), PHP_URL_PATH ) ?: '/';
+        $paths_to_invalidate[ $home_path ] = true;
+
+        $home_key  = md5( $host . $home_path );
+        $files_to_delete[ $home_key ] = $this->cache_dir . substr( $home_key, 0, 2 ) . '/' . $home_key . '.gz';
+
+        $shop_id = function_exists( 'wc_get_page_id' ) ? wc_get_page_id( 'shop' ) : 0;
+        if ( $shop_id > 0 ) {
+            $shop_url  = get_permalink( $shop_id );
+            $shop_path = parse_url( $shop_url, PHP_URL_PATH ) ?: '/shop/';
+            $paths_to_invalidate[ $shop_path ] = true;
+            $shop_key  = md5( $host . $shop_path );
+            $files_to_delete[ $shop_key ] = $this->cache_dir . substr( $shop_key, 0, 2 ) . '/' . $shop_key . '.gz';
+        }
+
+        // Raccogli i path di ogni prodotto e le sue categorie.
+        foreach ( $product_ids as $product_id ) {
+            $permalink = get_permalink( $product_id );
+            if ( $permalink ) {
+                $parsed = parse_url( $permalink );
+                $path   = isset( $parsed['path'] ) ? $parsed['path'] : '/';
+                $paths_to_invalidate[ $path ] = true;
+                $key = md5( $host . $path );
+                $files_to_delete[ $key ] = $this->cache_dir . substr( $key, 0, 2 ) . '/' . $key . '.gz';
+            }
+
+            $terms = get_the_terms( $product_id, 'product_cat' );
+            if ( $terms && ! is_wp_error( $terms ) ) {
+                foreach ( $terms as $term ) {
+                    $term_url  = get_term_link( $term );
+                    if ( ! is_wp_error( $term_url ) ) {
+                        $term_path = parse_url( $term_url, PHP_URL_PATH ) ?: '';
+                        if ( $term_path ) {
+                            $paths_to_invalidate[ $term_path ] = true;
+                            $term_key = md5( $host . $term_path );
+                            $files_to_delete[ $term_key ] = $this->cache_dir . substr( $term_key, 0, 2 ) . '/' . $term_key . '.gz';
+                        }
+                    }
+                }
             }
         }
 
-        delete_transient( 'ocm_cache_bulk_ids' );
+        // Cancella i file esatti.
+        foreach ( $files_to_delete as $file ) {
+            if ( file_exists( $file ) ) {
+                @unlink( $file );
+            }
+        }
+
+        // Scansiona l'indice URL UNA volta per trovare tutte le varianti filtrate.
+        if ( ! empty( $index ) ) {
+            foreach ( $index as $line ) {
+                $parts = explode( '|', $line, 3 );
+                if ( count( $parts ) !== 3 ) {
+                    continue;
+                }
+                list( $hash, $stored_host, $stored_uri ) = $parts;
+                if ( $stored_host !== $host ) {
+                    continue;
+                }
+                $stored_path = (string) parse_url( $stored_uri, PHP_URL_PATH );
+                if ( isset( $paths_to_invalidate[ $stored_path ] ) ) {
+                    $cache_file = $this->cache_dir . substr( $hash, 0, 2 ) . '/' . $hash . '.gz';
+                    if ( file_exists( $cache_file ) ) {
+                        @unlink( $cache_file );
+                    }
+                }
+            }
+        }
+
+        // Resetta la cache dell'indice in memoria dopo le invalidazioni.
+        $this->reset_url_index_cache();
     }
 
     // =============================================================
@@ -539,11 +727,56 @@ class Open_Cache_Manager {
     // =============================================================
 
     /**
-     * Svuota tutta la cache.
+     * Svuota tutta la cache (soft purge).
+     *
+     * Non cancella fisicamente i file .gz: scrive un marker `.invalidated_at`
+     * con il timestamp corrente. Il drop-in advanced-cache.php confronta il
+     * mtime dei file con questo marker e li considera stale.
+     *
+     * Stale-while-revalidate: il drop-in continua a servire i file stale ai
+     * visitatori (zero lag) mentre un processo alla volta rigenera la pagina.
+     * Questo elimina il "thundering herd" che rallentava il sito dopo ogni clear.
+     *
+     * @return int Numero di file invalidati.
+     */
+    public function clear_all() {
+        if ( ! is_dir( $this->cache_dir ) ) {
+            return 0;
+        }
+
+        // Scrivi il marker di invalidazione. Il drop-in lo legge per capire
+        // che i file con mtime < questo timestamp sono stale.
+        @file_put_contents(
+            $this->cache_dir . '.invalidated_at',
+            (string) time(),
+            LOCK_EX
+        );
+
+        // Resetta il contatore globale REGEN (i lock vecchi diventano obsoleti).
+        @file_put_contents( $this->cache_dir . '.regen_count', '0', LOCK_EX );
+
+        // Cancella l'indice URL: verrà ricostruito man mano che le pagine
+        // vengono rigenerate dal drop-in.
+        $index_file = $this->cache_dir . '.url_index';
+        if ( file_exists( $index_file ) ) {
+            @unlink( $index_file );
+        }
+
+        clearstatcache( true );
+        $this->reset_url_index_cache();
+
+        // Il conteggio non è più necessario (soft purge non cancella file).
+        // Le statistiche verranno ricalcolate da get_stats() che esclude i file stale.
+        return 0;
+    }
+
+    /**
+     * Cancella fisicamente i file .gz dalla cache (hard purge).
+     * Usato dalla disattivazione del plugin e dal cron per file scaduti.
      *
      * @return int Numero di file eliminati.
      */
-    public function clear_all() {
+    private function hard_clear_all() {
         $count = 0;
 
         if ( ! is_dir( $this->cache_dir ) ) {
@@ -555,10 +788,13 @@ class Open_Cache_Manager {
             RecursiveIteratorIterator::CHILD_FIRST
         );
 
+        // File di controllo nella directory cache da preservare.
+        $protected_files = array( '.active', '.excluded_urls', '.ttl' );
+
         foreach ( $iterator as $item ) {
             if ( $item->isFile() ) {
                 $basename = basename( $item->getPathname() );
-                if ( $basename === '.active' || $basename === '.excluded_urls' ) {
+                if ( in_array( $basename, $protected_files, true ) ) {
                     continue;
                 }
                 @unlink( $item->getPathname() );
@@ -567,6 +803,8 @@ class Open_Cache_Manager {
                 @rmdir( $item->getPathname() );
             }
         }
+
+        clearstatcache( true );
 
         return $count;
     }
@@ -583,18 +821,159 @@ class Open_Cache_Manager {
         $ttl     = isset( $options['ttl'] ) ? (int) $options['ttl'] : $this->default_ttl;
         $now     = time();
 
+        // Leggi timestamp di invalidazione soft purge.
+        $inv_file       = $this->cache_dir . '.invalidated_at';
+        $invalidated_at = file_exists( $inv_file ) ? (int) @file_get_contents( $inv_file ) : 0;
+
         $iterator = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
+            new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::CHILD_FIRST
         );
 
-        foreach ( $iterator as $file ) {
-            if ( $file->isFile() && ( $now - $file->getMTime() ) > $ttl ) {
-                $basename = basename( $file->getPathname() );
-                if ( $basename === '.active' || $basename === '.excluded_urls' ) {
+        $protected_files = array( '.active', '.excluded_urls', '.ttl', '.url_index', '.invalidated_at', '.regen_count' );
+        $stale_deleted   = 0;
+        $stale_remaining = 0;
+
+        foreach ( $iterator as $item ) {
+            if ( $item->isFile() ) {
+                $basename = basename( $item->getPathname() );
+                if ( in_array( $basename, $protected_files, true ) ) {
                     continue;
                 }
-                @unlink( $file->getPathname() );
+
+                // Cancella lock file orfani (> 60s).
+                if ( substr( $basename, -5 ) === '.lock' ) {
+                    if ( ( $now - $item->getMTime() ) > 60 ) {
+                        @unlink( $item->getPathname() );
+                    }
+                    continue;
+                }
+
+                // Cancella file tmp orfani (> 60s).
+                if ( strpos( $basename, '.tmp.' ) !== false ) {
+                    if ( ( $now - $item->getMTime() ) > 60 ) {
+                        @unlink( $item->getPathname() );
+                    }
+                    continue;
+                }
+
+                $mtime = $item->getMTime();
+
+                // File scaduto per TTL → cancella.
+                if ( ( $now - $mtime ) > $ttl ) {
+                    @unlink( $item->getPathname() );
+                    continue;
+                }
+
+                // File stale (invalidato) che non è stato ancora rigenerato.
+                // Il drop-in li rigenera on-demand. Al cron seguente verranno
+                // cancellati se ancora stale.
+                if ( $invalidated_at > 0 && $mtime < $invalidated_at ) {
+                    $stale_remaining++;
+                }
+            } elseif ( $item->isDir() ) {
+                @rmdir( $item->getPathname() );
             }
+        }
+
+        // Se tutti i file stale sono stati rigenerati, rimuovi il marker di invalidazione.
+        if ( $invalidated_at > 0 && $stale_remaining === 0 ) {
+            @unlink( $inv_file );
+        }
+
+        // Reset contatore REGEN se bloccato (file vecchio > 5 minuti).
+        $regen_count_file = $this->cache_dir . '.regen_count';
+        if ( file_exists( $regen_count_file ) && ( $now - filemtime( $regen_count_file ) ) > 300 ) {
+            @file_put_contents( $regen_count_file, '0', LOCK_EX );
+        }
+
+        // Pulisci l'indice URL: rimuovi le righe duplicate e quelle il cui file
+        // .gz non esiste più (cancellato dal TTL o dall'invalidazione).
+        $this->cleanup_url_index();
+    }
+
+    /**
+     * Ricostruisce .url_index rimuovendo duplicati e voci orfane (file .gz assente).
+     */
+    private function cleanup_url_index() {
+        $index_file = $this->cache_dir . '.url_index';
+        if ( ! file_exists( $index_file ) ) {
+            return;
+        }
+
+        $lines = @file( $index_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+        if ( ! is_array( $lines ) || empty( $lines ) ) {
+            return;
+        }
+
+        $seen  = array();
+        $clean = array();
+
+        foreach ( $lines as $line ) {
+            $parts = explode( '|', $line, 3 );
+            if ( count( $parts ) !== 3 ) {
+                continue;
+            }
+
+            $hash = $parts[0];
+
+            // Skip duplicati (stesso hash = stessa URL, teniamo solo la prima).
+            if ( isset( $seen[ $hash ] ) ) {
+                continue;
+            }
+
+            // Skip voci il cui file cache non esiste più.
+            $cache_file = $this->cache_dir . substr( $hash, 0, 2 ) . '/' . $hash . '.gz';
+            if ( ! file_exists( $cache_file ) ) {
+                continue;
+            }
+
+            $seen[ $hash ] = true;
+            $clean[]       = $line;
+        }
+
+        // Riscrivi l'indice solo se è cambiato (evita I/O inutile).
+        if ( count( $clean ) < count( $lines ) ) {
+            @file_put_contents( $index_file, implode( "\n", $clean ) . "\n", LOCK_EX );
+        }
+    }
+
+    /**
+     * Invia richieste non bloccanti alle pagine critiche per riscaldare la cache.
+     * Usa wp_remote_get con timeout minimo e blocking=false per non rallentare la risposta admin.
+     */
+    private function warm_critical_pages() {
+        $urls = array( home_url( '/' ) );
+
+        // Pagina shop WooCommerce.
+        if ( function_exists( 'wc_get_page_permalink' ) ) {
+            $shop_url = wc_get_page_permalink( 'shop' );
+            if ( $shop_url ) {
+                $urls[] = $shop_url;
+            }
+        }
+
+        // URL personalizzati di preload configurati dall'utente.
+        $options     = get_option( 'open_cache_manager', array() );
+        $preload_raw = isset( $options['preload_urls'] ) ? $options['preload_urls'] : '';
+        if ( $preload_raw ) {
+            $custom_urls = array_filter( array_map( 'trim', explode( "\n", $preload_raw ) ) );
+            foreach ( $custom_urls as $custom_url ) {
+                if ( strpos( $custom_url, '/' ) === 0 ) {
+                    $custom_url = home_url( $custom_url );
+                }
+                $urls[] = $custom_url;
+            }
+        }
+
+        $urls = array_unique( $urls );
+
+        foreach ( $urls as $url ) {
+            wp_remote_get( $url, array(
+                'timeout'   => 0.5,
+                'blocking'  => false,
+                'sslverify' => false,
+            ) );
         }
     }
 
@@ -619,15 +998,25 @@ class Open_Cache_Manager {
             return $stats;
         }
 
+        // Leggi il timestamp di invalidazione: i file con mtime anteriore sono stale.
+        $inv_file      = $this->cache_dir . '.invalidated_at';
+        $invalidated_at = file_exists( $inv_file ) ? (int) @file_get_contents( $inv_file ) : 0;
+
         $iterator = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
         );
 
         foreach ( $iterator as $file ) {
             if ( $file->isFile() && $file->getExtension() === 'gz' ) {
+                $mtime = $file->getMTime();
+
+                // Ignora i file stale (invalidati da soft purge).
+                if ( $invalidated_at > 0 && $mtime < $invalidated_at ) {
+                    continue;
+                }
+
                 $stats['files']++;
                 $stats['size'] += $file->getSize();
-                $mtime = $file->getMTime();
 
                 if ( $stats['oldest'] === 0 || $mtime < $stats['oldest'] ) {
                     $stats['oldest'] = $mtime;
@@ -695,8 +1084,9 @@ class Open_Cache_Manager {
             if ( ! current_user_can( 'manage_options' ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'ocm_clear_cache' ) ) {
                 wp_die( 'Non autorizzato' );
             }
-            $count = $this->clear_all();
-            set_transient( 'ocm_cache_notice', sprintf( 'Cache svuotata! %d file eliminati.', $count ), 30 );
+            $this->clear_all();
+            $this->warm_critical_pages();
+            set_transient( 'ocm_cache_notice', 'Cache invalidata! Le pagine verranno rigenerate gradualmente.', 30 );
             wp_safe_redirect( wp_get_referer() ? wp_get_referer() : admin_url() );
             exit;
         }
@@ -723,6 +1113,33 @@ class Open_Cache_Manager {
             wp_safe_redirect( admin_url( 'admin.php?page=' . $this->options_page ) );
             exit;
         }
+    }
+
+    /**
+     * AJAX handler per svuotamento cache.
+     * Restituisce le statistiche aggiornate dopo lo svuotamento.
+     */
+    public function ajax_clear_cache() {
+        check_ajax_referer( 'ocm_ajax_clear_cache', 'nonce' );
+
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Non autorizzato', 403 );
+        }
+
+        $this->clear_all();
+
+        // Warm-up asincrono delle pagine critiche dopo lo svuotamento.
+        $this->warm_critical_pages();
+
+        $stats = $this->get_stats();
+
+        wp_send_json_success( array(
+            'files'   => $stats['files'],
+            'size'    => $this->format_bytes( $stats['size'] ),
+            'oldest'  => $stats['oldest'] ? date( 'd/m/Y H:i:s', $stats['oldest'] ) : '-',
+            'newest'  => $stats['newest'] ? date( 'd/m/Y H:i:s', $stats['newest'] ) : '-',
+            'message' => 'Cache invalidata! Le pagine verranno rigenerate gradualmente.',
+        ) );
     }
 
     /**
@@ -884,6 +1301,30 @@ class Open_Cache_Manager {
             );
         }
 
+        // 8. Indice URL (invalidazione filtri)
+        $index_file = $this->cache_dir . '.url_index';
+        if ( file_exists( $index_file ) ) {
+            $line_count = 0;
+            $fh = @fopen( $index_file, 'r' );
+            if ( $fh ) {
+                while ( fgets( $fh ) !== false ) {
+                    $line_count++;
+                }
+                fclose( $fh );
+            }
+            $checks[] = array(
+                'label'  => 'Indice URL (invalidazione filtri)',
+                'status' => 'ok',
+                'note'   => 'Attivo — ' . number_format( $line_count ) . ' URL indicizzati',
+            );
+        } else {
+            $checks[] = array(
+                'label'  => 'Indice URL (invalidazione filtri)',
+                'status' => 'warning',
+                'note'   => 'Non ancora creato. Si popola automaticamente quando le pagine vengono cachate.',
+            );
+        }
+
         return $checks;
     }
 
@@ -1004,25 +1445,67 @@ class Open_Cache_Manager {
             <!-- Statistiche -->
             <div class="card" style="max-width:600px; padding:15px; margin-bottom:20px;">
                 <h2>Statistiche</h2>
+                <div id="ocm-clear-notice" style="display:none; margin-bottom:12px; padding:8px 12px; background:#00a32a; color:#fff; border-radius:3px;"></div>
                 <table class="widefat" style="max-width:400px;">
-                    <tr><th>Pagine in cache</th><td><strong><?php echo (int) $stats['files']; ?></strong></td></tr>
-                    <tr><th>Dimensione totale</th><td><strong><?php echo esc_html( $this->format_bytes( $stats['size'] ) ); ?></strong></td></tr>
+                    <tr><th>Pagine in cache</th><td><strong id="ocm-stat-files"><?php echo (int) $stats['files']; ?></strong></td></tr>
+                    <tr><th>Dimensione totale</th><td><strong id="ocm-stat-size"><?php echo esc_html( $this->format_bytes( $stats['size'] ) ); ?></strong></td></tr>
                     <tr>
                         <th>File più vecchio</th>
-                        <td><?php echo $stats['oldest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['oldest'] ) ) : '-'; ?></td>
+                        <td id="ocm-stat-oldest"><?php echo $stats['oldest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['oldest'] ) ) : '-'; ?></td>
                     </tr>
                     <tr>
                         <th>File più recente</th>
-                        <td><?php echo $stats['newest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['newest'] ) ) : '-'; ?></td>
+                        <td id="ocm-stat-newest"><?php echo $stats['newest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['newest'] ) ) : '-'; ?></td>
                     </tr>
                 </table>
                 <br>
-                <a href="<?php echo wp_nonce_url( admin_url( 'admin.php?action=ocm_clear_cache' ), 'ocm_clear_cache' ); ?>"
-                   class="button button-secondary"
-                   onclick="return confirm('Svuotare tutta la cache?');">
+                <button type="button" id="ocm-clear-cache-btn" class="button button-secondary">
                     Svuota tutta la cache
-                </a>
+                </button>
+                <span id="ocm-clear-spinner" class="spinner" style="float:none; margin-top:0;"></span>
             </div>
+            <script>
+            (function(){
+                var btn     = document.getElementById('ocm-clear-cache-btn');
+                var spinner = document.getElementById('ocm-clear-spinner');
+                var notice  = document.getElementById('ocm-clear-notice');
+
+                btn.addEventListener('click', function(){
+                    if ( ! confirm('Svuotare tutta la cache?') ) return;
+
+                    btn.disabled = true;
+                    spinner.classList.add('is-active');
+                    notice.style.display = 'none';
+
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', ajaxurl, true);
+                    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                    xhr.onreadystatechange = function(){
+                        if ( xhr.readyState !== 4 ) return;
+                        btn.disabled = false;
+                        spinner.classList.remove('is-active');
+
+                        if ( xhr.status === 200 ) {
+                            try {
+                                var res = JSON.parse(xhr.responseText);
+                                if ( res.success && res.data ) {
+                                    document.getElementById('ocm-stat-files').textContent  = res.data.files;
+                                    document.getElementById('ocm-stat-size').textContent   = res.data.size;
+                                    document.getElementById('ocm-stat-oldest').textContent = res.data.oldest;
+                                    document.getElementById('ocm-stat-newest').textContent = res.data.newest;
+                                    notice.textContent    = res.data.message;
+                                    notice.style.display  = 'block';
+                                    /* Aggiorna anche il contatore nella admin bar */
+                                    var abNode = document.querySelector('#wp-admin-bar-ocm-cache .ab-item');
+                                    if ( abNode ) abNode.textContent = 'OCM Cache (' + res.data.files + ')';
+                                }
+                            } catch(e) {}
+                        }
+                    };
+                    xhr.send('action=ocm_ajax_clear_cache&nonce=<?php echo wp_create_nonce( 'ocm_ajax_clear_cache' ); ?>');
+                });
+            })();
+            </script>
 
             <!-- Impostazioni -->
             <form method="post">
@@ -1419,8 +1902,8 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
          */
         public function clear() {
             $plugin = new Open_Cache_Manager();
-            $count  = $plugin->clear_all();
-            WP_CLI::success( sprintf( 'Cache svuotata. %d file eliminati.', $count ) );
+            $plugin->clear_all();
+            WP_CLI::success( 'Cache invalidata. Le pagine verranno rigenerate gradualmente.' );
         }
 
         /**
