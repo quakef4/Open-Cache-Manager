@@ -16,7 +16,7 @@
  *   X-OCM-Cache: REGEN           → pagina in rigenerazione (questo processo la rigenera)
  *
  * @package Open_Cache_Manager
- * @version 2.1.2
+ * @version 2.1.3
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -240,8 +240,41 @@ if ( file_exists( $cache_file ) ) {
         ocm_serve_cached_file( $cache_file );
     }
 
+    // Limite globale di rigenerazione: max 3 processi REGEN alla volta.
+    // Dopo un clear_all con 1000+ pagine stale, senza questo limite
+    // ogni pagina diversa lancerebbe un boot completo di WordPress,
+    // sovraccaricando il server (CPU e RAM).
+    $regen_count_file = OCM_CACHE_DIR . '.regen_count';
+    $regen_limit      = 3;
+    $regen_allowed    = false;
+
+    // Leggi e incrementa atomicamente il contatore con flock.
+    $regen_fh = @fopen( $regen_count_file, 'c+' );
+    if ( $regen_fh && flock( $regen_fh, LOCK_EX ) ) {
+        $current = (int) fread( $regen_fh, 10 );
+        if ( $current < $regen_limit ) {
+            fseek( $regen_fh, 0 );
+            ftruncate( $regen_fh, 0 );
+            fwrite( $regen_fh, (string) ( $current + 1 ) );
+            $regen_allowed = true;
+        }
+        flock( $regen_fh, LOCK_UN );
+        fclose( $regen_fh );
+    }
+
+    if ( ! $regen_allowed ) {
+        // Troppi REGEN attivi → rilascia il lock della pagina, servi stale.
+        @unlink( $lock_file );
+        header( 'X-OCM-Cache: STALE' );
+        header( 'X-OCM-Cache-Age: ' . $file_age . 's' );
+        ocm_serve_cached_file( $cache_file );
+    }
+
     // Questo processo ha il lock → rigenera la pagina.
     // Il file .gz viene sovrascritto dalla callback di output buffering.
+    define( 'OCM_REGEN_ACTIVE', true );
+    // Shutdown function di sicurezza: decrementa il contatore anche se PHP crasha.
+    register_shutdown_function( 'ocm_cleanup_lock' );
     header( 'X-OCM-Cache: REGEN' );
     // Fall through a ob_start() sotto.
 
@@ -336,21 +369,12 @@ function ocm_cache_output_callback( $html ) {
 
     // Aggiorna l'indice URL per consentire l'invalidazione per prefisso path.
     // Formato: hash|host|request_uri (una riga per URL cachato).
-    // Controlla se l'hash è già presente per evitare duplicati (il file cresce
-    // senza limiti se ogni REGEN aggiunge una riga).
+    // Append diretto senza dedup nel hot path: i duplicati vengono puliti
+    // periodicamente dal cron (cleanup_url_index). Leggere l'intero file
+    // qui causerebbe I/O O(N²) dopo un clear_all con 1000+ pagine stale.
     $index_file = OCM_CACHE_DIR . '.url_index';
     $index_line = OCM_CACHE_KEY . '|' . OCM_CACHE_HOST . '|' . OCM_CACHE_REQUEST_URI . "\n";
-    $needs_append = true;
-    if ( file_exists( $index_file ) && filesize( $index_file ) < 2097152 ) {
-        // Per file < 2MB: verifica se l'hash è già indicizzato.
-        $existing = @file_get_contents( $index_file );
-        if ( $existing !== false && strpos( $existing, OCM_CACHE_KEY . '|' ) !== false ) {
-            $needs_append = false;
-        }
-    }
-    if ( $needs_append ) {
-        @file_put_contents( $index_file, $index_line, FILE_APPEND | LOCK_EX );
-    }
+    @file_put_contents( $index_file, $index_line, FILE_APPEND | LOCK_EX );
 
     ocm_cleanup_lock();
     @header( 'X-OCM-Save: ok' );
@@ -358,11 +382,32 @@ function ocm_cache_output_callback( $html ) {
 }
 
 /**
- * Rimuove il lock file dopo il salvataggio o in caso di errore.
+ * Rimuove il lock file e decrementa il contatore globale REGEN.
+ * Idempotente: può essere chiamata sia dalla callback che dallo shutdown.
  */
 function ocm_cleanup_lock() {
+    static $already_cleaned = false;
+    if ( $already_cleaned ) {
+        return;
+    }
+    $already_cleaned = true;
+
     if ( defined( 'OCM_LOCK_FILE' ) && OCM_LOCK_FILE !== '' && file_exists( OCM_LOCK_FILE ) ) {
         @unlink( OCM_LOCK_FILE );
+    }
+
+    // Decrementa il contatore globale dei REGEN attivi.
+    if ( defined( 'OCM_REGEN_ACTIVE' ) && OCM_REGEN_ACTIVE ) {
+        $regen_count_file = OCM_CACHE_DIR . '.regen_count';
+        $fh = @fopen( $regen_count_file, 'c+' );
+        if ( $fh && flock( $fh, LOCK_EX ) ) {
+            $current = max( 0, (int) fread( $fh, 10 ) - 1 );
+            fseek( $fh, 0 );
+            ftruncate( $fh, 0 );
+            fwrite( $fh, (string) $current );
+            flock( $fh, LOCK_UN );
+            fclose( $fh );
+        }
     }
 }
 

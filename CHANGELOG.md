@@ -4,6 +4,21 @@ Tutte le modifiche rilevanti al plugin sono documentate in questo file.
 
 ---
 
+## [2.1.3] - 2026-03-09
+
+### Fix
+- **REGEN stampede dopo clear_all()**: dopo lo svuotamento cache, ogni pagina stale (1000+) lanciava un boot completo di WordPress in parallelo, saturando CPU e RAM del server. Aggiunto limite globale di concorrenza: max 3 processi REGEN attivi contemporaneamente, tutti gli altri servono stale content (zero lag). Contatore atomico con `flock()`, shutdown function di sicurezza, auto-reset dopo 5 minuti nel cron
+- **Dedup `.url_index` nel drop-in leggeva tutto il file ad ogni REGEN**: il check anti-duplicati aggiunto in v2.1.2 faceva `file_get_contents()` dell'intero indice ad ogni salvataggio cache. Dopo un clear_all con 1000 pagine stale, questo causava I/O cumulativo O(N²) (~50MB). Rimosso il check dal hot path: i duplicati vengono puliti dal cron (`cleanup_url_index`)
+- **`clear_all()` iterava tutta la directory**: scansionava ricorsivamente tutte le sottodirectory solo per contare i file .gz prima del soft purge. Con 1000+ file, aggiungeva latenza inutile all'operazione di svuotamento
+
+### Migliorato
+- `clear_all()` resetta il contatore REGEN globale per evitare stale counter dopo invalidazione
+- `cleanup_expired()` resetta `.regen_count` se bloccato da > 5 minuti
+- `ocm_cleanup_lock()` è ora idempotente (safe per doppia chiamata da callback + shutdown)
+- Messaggi admin aggiornati: "Cache invalidata! Le pagine verranno rigenerate gradualmente"
+
+---
+
 ## [2.1.2] - 2026-03-09
 
 ### Fix

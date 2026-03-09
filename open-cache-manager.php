@@ -3,7 +3,7 @@
  * Plugin Name: Open Cache Manager
  * Plugin URI:  https://github.com/quakef4/Open-Cache-Manager
  * Description: Cache manager per WordPress/WooCommerce con page cache gzip, ottimizzazione database e invalidazione intelligente per cataloghi di grandi dimensioni.
- * Version:     2.1.2
+ * Version:     2.1.3
  * Author:      quakef4
  * Author URI:  https://github.com/quakef4/Open-Cache-Manager
  * License:     GPL-2.0+
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OCM_VERSION', '2.1.2' );
+define( 'OCM_VERSION', '2.1.3' );
 define( 'OCM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'OCM_PLUGIN_FILE', __FILE__ );
 
@@ -744,17 +744,6 @@ class Open_Cache_Manager {
             return 0;
         }
 
-        // Conta i file .gz che verranno invalidati.
-        $count = 0;
-        $iterator = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
-        );
-        foreach ( $iterator as $file ) {
-            if ( $file->isFile() && $file->getExtension() === 'gz' ) {
-                $count++;
-            }
-        }
-
         // Scrivi il marker di invalidazione. Il drop-in lo legge per capire
         // che i file con mtime < questo timestamp sono stale.
         @file_put_contents(
@@ -762,6 +751,9 @@ class Open_Cache_Manager {
             (string) time(),
             LOCK_EX
         );
+
+        // Resetta il contatore globale REGEN (i lock vecchi diventano obsoleti).
+        @file_put_contents( $this->cache_dir . '.regen_count', '0', LOCK_EX );
 
         // Cancella l'indice URL: verrà ricostruito man mano che le pagine
         // vengono rigenerate dal drop-in.
@@ -773,7 +765,9 @@ class Open_Cache_Manager {
         clearstatcache( true );
         $this->reset_url_index_cache();
 
-        return $count;
+        // Il conteggio non è più necessario (soft purge non cancella file).
+        // Le statistiche verranno ricalcolate da get_stats() che esclude i file stale.
+        return 0;
     }
 
     /**
@@ -836,7 +830,7 @@ class Open_Cache_Manager {
             RecursiveIteratorIterator::CHILD_FIRST
         );
 
-        $protected_files = array( '.active', '.excluded_urls', '.ttl', '.url_index', '.invalidated_at' );
+        $protected_files = array( '.active', '.excluded_urls', '.ttl', '.url_index', '.invalidated_at', '.regen_count' );
         $stale_deleted   = 0;
         $stale_remaining = 0;
 
@@ -885,6 +879,12 @@ class Open_Cache_Manager {
         // Se tutti i file stale sono stati rigenerati, rimuovi il marker di invalidazione.
         if ( $invalidated_at > 0 && $stale_remaining === 0 ) {
             @unlink( $inv_file );
+        }
+
+        // Reset contatore REGEN se bloccato (file vecchio > 5 minuti).
+        $regen_count_file = $this->cache_dir . '.regen_count';
+        if ( file_exists( $regen_count_file ) && ( $now - filemtime( $regen_count_file ) ) > 300 ) {
+            @file_put_contents( $regen_count_file, '0', LOCK_EX );
         }
 
         // Pulisci l'indice URL: rimuovi le righe duplicate e quelle il cui file
@@ -1084,9 +1084,9 @@ class Open_Cache_Manager {
             if ( ! current_user_can( 'manage_options' ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'ocm_clear_cache' ) ) {
                 wp_die( 'Non autorizzato' );
             }
-            $count = $this->clear_all();
+            $this->clear_all();
             $this->warm_critical_pages();
-            set_transient( 'ocm_cache_notice', sprintf( 'Cache svuotata! %d file eliminati.', $count ), 30 );
+            set_transient( 'ocm_cache_notice', 'Cache invalidata! Le pagine verranno rigenerate gradualmente.', 30 );
             wp_safe_redirect( wp_get_referer() ? wp_get_referer() : admin_url() );
             exit;
         }
@@ -1126,7 +1126,7 @@ class Open_Cache_Manager {
             wp_send_json_error( 'Non autorizzato', 403 );
         }
 
-        $count = $this->clear_all();
+        $this->clear_all();
 
         // Warm-up asincrono delle pagine critiche dopo lo svuotamento.
         $this->warm_critical_pages();
@@ -1134,12 +1134,11 @@ class Open_Cache_Manager {
         $stats = $this->get_stats();
 
         wp_send_json_success( array(
-            'deleted' => $count,
             'files'   => $stats['files'],
             'size'    => $this->format_bytes( $stats['size'] ),
             'oldest'  => $stats['oldest'] ? date( 'd/m/Y H:i:s', $stats['oldest'] ) : '-',
             'newest'  => $stats['newest'] ? date( 'd/m/Y H:i:s', $stats['newest'] ) : '-',
-            'message' => sprintf( 'Cache svuotata! %d file eliminati.', $count ),
+            'message' => 'Cache invalidata! Le pagine verranno rigenerate gradualmente.',
         ) );
     }
 
@@ -1903,8 +1902,8 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
          */
         public function clear() {
             $plugin = new Open_Cache_Manager();
-            $count  = $plugin->clear_all();
-            WP_CLI::success( sprintf( 'Cache svuotata. %d file eliminati.', $count ) );
+            $plugin->clear_all();
+            WP_CLI::success( 'Cache invalidata. Le pagine verranno rigenerate gradualmente.' );
         }
 
         /**

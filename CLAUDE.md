@@ -2,7 +2,7 @@
 
 ## Panoramica
 
-Questo è il plugin **Open Cache Manager** v2.1.2, un cache manager WordPress con page cache e ottimizzazione database, sviluppato per siti WooCommerce di grandi dimensioni (45.000+ prodotti, 15 fornitori, aggiornamenti bulk fino a 4.000 prodotti/ora).
+Questo è il plugin **Open Cache Manager** v2.1.3, un cache manager WordPress con page cache e ottimizzazione database, sviluppato per siti WooCommerce di grandi dimensioni (45.000+ prodotti, 15 fornitori, aggiornamenti bulk fino a 4.000 prodotti/ora).
 
 Precedentemente noto come "Infobit Page Cache", il plugin è stato rinominato e ristrutturato nella v2.0.0 con l'aggiunta del DB Optimizer.
 
