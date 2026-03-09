@@ -6,7 +6,7 @@
  * raccomandazioni ottimizzate per WooCommerce con cataloghi di grandi dimensioni.
  *
  * @package Open_Cache_Manager
- * @since   2.0.0
+ * @since   2.0.0 (aggiornato in 2.1.1)
  */
 
 if ( ! defined( 'ABSPATH' ) ) {

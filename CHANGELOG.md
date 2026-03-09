@@ -4,6 +4,21 @@ Tutte le modifiche rilevanti al plugin sono documentate in questo file.
 
 ---
 
+## [2.1.1] - 2026-03-09
+
+### Fix
+- **Contatore cache non si resettava**: il pulsante "Svuota tutta la cache" faceva un redirect dopo la cancellazione; nel tempo tra il clear e il ricaricamento della pagina i visitatori ri-cachavano le pagine, mostrando un conteggio non azzerato. Convertito a AJAX con aggiornamento immediato delle statistiche nel DOM
+- **File .ttl cancellato durante lo svuotamento**: `clear_all()` e `cleanup_expired()` non proteggevano il file `.ttl`, resettando il TTL al valore di default (3600s) dopo ogni svuotamento
+- **Sito lento dopo svuotamento cache**: aggiunto warm-up automatico non bloccante delle pagine critiche (homepage e shop) dopo ogni svuotamento (manuale, admin bar, bulk automatico)
+
+### Migliorato
+- Pulsante "Svuota tutta la cache" nella pagina impostazioni ora usa AJAX con spinner e notifica inline
+- Aggiunto `clearstatcache(true)` dopo la cancellazione per garantire letture filesystem aggiornate
+- Il contatore nella admin bar si aggiorna automaticamente dopo lo svuotamento AJAX
+- I file protetti nella directory cache (`.active`, `.excluded_urls`, `.ttl`) ora usano un array centralizzato
+
+---
+
 ## [2.0.0] - 2026-02-21
 
 ### Rinominazione e ristrutturazione

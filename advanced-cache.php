@@ -14,7 +14,7 @@
  *   X-OCM-Cache: MISS            → pagina non in cache, verrà salvata
  *
  * @package Open_Cache_Manager
- * @version 2.0.0
+ * @version 2.1.1
  */
 
 if ( ! defined( 'ABSPATH' ) ) {

@@ -3,7 +3,7 @@
  * Plugin Name: Open Cache Manager
  * Plugin URI:  https://github.com/quakef4/Open-Cache-Manager
  * Description: Cache manager per WordPress/WooCommerce con page cache gzip, ottimizzazione database e invalidazione intelligente per cataloghi di grandi dimensioni.
- * Version:     2.0.0
+ * Version:     2.1.1
  * Author:      quakef4
  * Author URI:  https://github.com/quakef4/Open-Cache-Manager
  * License:     GPL-2.0+
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OCM_VERSION', '2.0.0' );
+define( 'OCM_VERSION', '2.1.1' );
 define( 'OCM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'OCM_PLUGIN_FILE', __FILE__ );
 
