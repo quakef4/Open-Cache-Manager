@@ -3,7 +3,7 @@
  * Plugin Name: Open Cache Manager
  * Plugin URI:  https://github.com/quakef4/Open-Cache-Manager
  * Description: Cache manager per WordPress/WooCommerce con page cache gzip, ottimizzazione database e invalidazione intelligente per cataloghi di grandi dimensioni.
- * Version:     2.1.1
+ * Version:     2.1.2
  * Author:      quakef4
  * Author URI:  https://github.com/quakef4/Open-Cache-Manager
  * License:     GPL-2.0+
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OCM_VERSION', '2.1.1' );
+define( 'OCM_VERSION', '2.1.2' );
 define( 'OCM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'OCM_PLUGIN_FILE', __FILE__ );
 
@@ -57,6 +57,13 @@ class Open_Cache_Manager {
      * @var array
      */
     private $bulk_pending_ids = array();
+
+    /**
+     * Cache in memoria dell'indice URL (caricato una volta per richiesta).
+     *
+     * @var array|null
+     */
+    private $url_index_cache = null;
 
     /**
      * Costruttore.
@@ -444,20 +451,18 @@ class Open_Cache_Manager {
 
     /**
      * Invalida tutti i file cache il cui URL inizia con un determinato path.
-     * Usa l'indice URL se disponibile, altrimenti scansiona le directory.
+     * Usa l'indice URL se disponibile.
      *
      * @param string $host Hostname del sito.
      * @param string $path Path URL (es. /shop/, /product-category/scarpe/).
+     * @param array|null $index Indice URL pre-caricato (per evitare letture ripetute in batch).
      */
-    private function invalidate_by_prefix( $host, $path ) {
-        $index_file = $this->cache_dir . '.url_index';
-
-        if ( ! file_exists( $index_file ) ) {
-            return;
+    private function invalidate_by_prefix( $host, $path, $index = null ) {
+        if ( null === $index ) {
+            $index = $this->load_url_index();
         }
 
-        $index = @file( $index_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
-        if ( ! is_array( $index ) ) {
+        if ( empty( $index ) ) {
             return;
         }
 
@@ -483,6 +488,34 @@ class Open_Cache_Manager {
                 }
             }
         }
+    }
+
+    /**
+     * Carica l'indice URL dalla cache. Risultato memorizzato per la durata della richiesta.
+     *
+     * @return array Righe dell'indice URL.
+     */
+    private function load_url_index() {
+        if ( null !== $this->url_index_cache ) {
+            return $this->url_index_cache;
+        }
+
+        $index_file = $this->cache_dir . '.url_index';
+        if ( ! file_exists( $index_file ) ) {
+            $this->url_index_cache = array();
+            return $this->url_index_cache;
+        }
+
+        $index = @file( $index_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+        $this->url_index_cache = is_array( $index ) ? $index : array();
+        return $this->url_index_cache;
+    }
+
+    /**
+     * Resetta la cache in memoria dell'indice URL (dopo invalidazioni che lo modificano).
+     */
+    private function reset_url_index_cache() {
+        $this->url_index_cache = null;
     }
 
     /**
@@ -594,10 +627,99 @@ class Open_Cache_Manager {
             $this->clear_all();
             $this->warm_critical_pages();
         } else {
-            foreach ( $unique_ids as $product_id ) {
-                $this->invalidate_product_cache( $product_id );
+            $this->batch_invalidate_products( $unique_ids );
+        }
+    }
+
+    /**
+     * Invalida la cache per un batch di prodotti in modo efficiente.
+     * Carica l'indice URL una sola volta e lo riusa per tutte le invalidazioni,
+     * evitando letture ripetute del file (O(N*M) → O(N+M)).
+     *
+     * @param array $product_ids Array di ID prodotti da invalidare.
+     */
+    private function batch_invalidate_products( $product_ids ) {
+        // Carica l'indice URL una volta sola in memoria.
+        $index = $this->load_url_index();
+
+        // Raccogli tutti i path da invalidare (con deduplicazione).
+        $paths_to_invalidate = array();
+        $files_to_delete     = array();
+        $host                = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : parse_url( home_url(), PHP_URL_HOST );
+
+        // Homepage e shop sono comuni a tutti i prodotti: aggiungi una volta sola.
+        $home_path = parse_url( home_url( '/' ), PHP_URL_PATH ) ?: '/';
+        $paths_to_invalidate[ $home_path ] = true;
+
+        $home_key  = md5( $host . $home_path );
+        $files_to_delete[ $home_key ] = $this->cache_dir . substr( $home_key, 0, 2 ) . '/' . $home_key . '.gz';
+
+        $shop_id = function_exists( 'wc_get_page_id' ) ? wc_get_page_id( 'shop' ) : 0;
+        if ( $shop_id > 0 ) {
+            $shop_url  = get_permalink( $shop_id );
+            $shop_path = parse_url( $shop_url, PHP_URL_PATH ) ?: '/shop/';
+            $paths_to_invalidate[ $shop_path ] = true;
+            $shop_key  = md5( $host . $shop_path );
+            $files_to_delete[ $shop_key ] = $this->cache_dir . substr( $shop_key, 0, 2 ) . '/' . $shop_key . '.gz';
+        }
+
+        // Raccogli i path di ogni prodotto e le sue categorie.
+        foreach ( $product_ids as $product_id ) {
+            $permalink = get_permalink( $product_id );
+            if ( $permalink ) {
+                $parsed = parse_url( $permalink );
+                $path   = isset( $parsed['path'] ) ? $parsed['path'] : '/';
+                $paths_to_invalidate[ $path ] = true;
+                $key = md5( $host . $path );
+                $files_to_delete[ $key ] = $this->cache_dir . substr( $key, 0, 2 ) . '/' . $key . '.gz';
+            }
+
+            $terms = get_the_terms( $product_id, 'product_cat' );
+            if ( $terms && ! is_wp_error( $terms ) ) {
+                foreach ( $terms as $term ) {
+                    $term_url  = get_term_link( $term );
+                    if ( ! is_wp_error( $term_url ) ) {
+                        $term_path = parse_url( $term_url, PHP_URL_PATH ) ?: '';
+                        if ( $term_path ) {
+                            $paths_to_invalidate[ $term_path ] = true;
+                            $term_key = md5( $host . $term_path );
+                            $files_to_delete[ $term_key ] = $this->cache_dir . substr( $term_key, 0, 2 ) . '/' . $term_key . '.gz';
+                        }
+                    }
+                }
             }
         }
+
+        // Cancella i file esatti.
+        foreach ( $files_to_delete as $file ) {
+            if ( file_exists( $file ) ) {
+                @unlink( $file );
+            }
+        }
+
+        // Scansiona l'indice URL UNA volta per trovare tutte le varianti filtrate.
+        if ( ! empty( $index ) ) {
+            foreach ( $index as $line ) {
+                $parts = explode( '|', $line, 3 );
+                if ( count( $parts ) !== 3 ) {
+                    continue;
+                }
+                list( $hash, $stored_host, $stored_uri ) = $parts;
+                if ( $stored_host !== $host ) {
+                    continue;
+                }
+                $stored_path = (string) parse_url( $stored_uri, PHP_URL_PATH );
+                if ( isset( $paths_to_invalidate[ $stored_path ] ) ) {
+                    $cache_file = $this->cache_dir . substr( $hash, 0, 2 ) . '/' . $hash . '.gz';
+                    if ( file_exists( $cache_file ) ) {
+                        @unlink( $cache_file );
+                    }
+                }
+            }
+        }
+
+        // Resetta la cache dell'indice in memoria dopo le invalidazioni.
+        $this->reset_url_index_cache();
     }
 
     // =============================================================
@@ -649,6 +771,7 @@ class Open_Cache_Manager {
         }
 
         clearstatcache( true );
+        $this->reset_url_index_cache();
 
         return $count;
     }
@@ -762,6 +885,56 @@ class Open_Cache_Manager {
         // Se tutti i file stale sono stati rigenerati, rimuovi il marker di invalidazione.
         if ( $invalidated_at > 0 && $stale_remaining === 0 ) {
             @unlink( $inv_file );
+        }
+
+        // Pulisci l'indice URL: rimuovi le righe duplicate e quelle il cui file
+        // .gz non esiste più (cancellato dal TTL o dall'invalidazione).
+        $this->cleanup_url_index();
+    }
+
+    /**
+     * Ricostruisce .url_index rimuovendo duplicati e voci orfane (file .gz assente).
+     */
+    private function cleanup_url_index() {
+        $index_file = $this->cache_dir . '.url_index';
+        if ( ! file_exists( $index_file ) ) {
+            return;
+        }
+
+        $lines = @file( $index_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+        if ( ! is_array( $lines ) || empty( $lines ) ) {
+            return;
+        }
+
+        $seen  = array();
+        $clean = array();
+
+        foreach ( $lines as $line ) {
+            $parts = explode( '|', $line, 3 );
+            if ( count( $parts ) !== 3 ) {
+                continue;
+            }
+
+            $hash = $parts[0];
+
+            // Skip duplicati (stesso hash = stessa URL, teniamo solo la prima).
+            if ( isset( $seen[ $hash ] ) ) {
+                continue;
+            }
+
+            // Skip voci il cui file cache non esiste più.
+            $cache_file = $this->cache_dir . substr( $hash, 0, 2 ) . '/' . $hash . '.gz';
+            if ( ! file_exists( $cache_file ) ) {
+                continue;
+            }
+
+            $seen[ $hash ] = true;
+            $clean[]       = $line;
+        }
+
+        // Riscrivi l'indice solo se è cambiato (evita I/O inutile).
+        if ( count( $clean ) < count( $lines ) ) {
+            @file_put_contents( $index_file, implode( "\n", $clean ) . "\n", LOCK_EX );
         }
     }
 

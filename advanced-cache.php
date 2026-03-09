@@ -16,7 +16,7 @@
  *   X-OCM-Cache: REGEN           → pagina in rigenerazione (questo processo la rigenera)
  *
  * @package Open_Cache_Manager
- * @version 2.1.1
+ * @version 2.1.2
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -336,9 +336,21 @@ function ocm_cache_output_callback( $html ) {
 
     // Aggiorna l'indice URL per consentire l'invalidazione per prefisso path.
     // Formato: hash|host|request_uri (una riga per URL cachato).
+    // Controlla se l'hash è già presente per evitare duplicati (il file cresce
+    // senza limiti se ogni REGEN aggiunge una riga).
     $index_file = OCM_CACHE_DIR . '.url_index';
     $index_line = OCM_CACHE_KEY . '|' . OCM_CACHE_HOST . '|' . OCM_CACHE_REQUEST_URI . "\n";
-    @file_put_contents( $index_file, $index_line, FILE_APPEND | LOCK_EX );
+    $needs_append = true;
+    if ( file_exists( $index_file ) && filesize( $index_file ) < 2097152 ) {
+        // Per file < 2MB: verifica se l'hash è già indicizzato.
+        $existing = @file_get_contents( $index_file );
+        if ( $existing !== false && strpos( $existing, OCM_CACHE_KEY . '|' ) !== false ) {
+            $needs_append = false;
+        }
+    }
+    if ( $needs_append ) {
+        @file_put_contents( $index_file, $index_line, FILE_APPEND | LOCK_EX );
+    }
 
     ocm_cleanup_lock();
     @header( 'X-OCM-Save: ok' );

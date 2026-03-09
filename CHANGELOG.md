@@ -4,6 +4,19 @@ Tutte le modifiche rilevanti al plugin sono documentate in questo file.
 
 ---
 
+## [2.1.2] - 2026-03-09
+
+### Fix
+- **Lag durante bulk sotto soglia (O(N*M) → O(N+M))**: `bulk_end()` sotto soglia chiamava `invalidate_product_cache()` per ogni prodotto, che a sua volta chiamava `invalidate_url()` 3-5 volte ciascuna, ognuna leggendo l'intero `.url_index` da disco. Con 40 prodotti × 5 URL × 4.441 righe = ~888.000 operazioni I/O. Ora `batch_invalidate_products()` carica l'indice una sola volta e scansiona le varianti in un singolo passaggio
+- **`.url_index` cresceva con duplicati**: il drop-in aggiungeva una riga ad ogni MISS/REGEN senza verificare se l'URL era già indicizzato. Dopo soft purge (clear_all) + rigenerazione, ogni pagina veniva re-aggiunta creando duplicati (4.441 righe per 1.008 pagine). Aggiunto controllo hash prima dell'append
+- **`.url_index` mai pulito**: le voci di file cache cancellati (per TTL o invalidazione) restavano nell'indice per sempre. Aggiunto `cleanup_url_index()` al cron che rimuove duplicati e voci orfane (file .gz assente)
+
+### Migliorato
+- `load_url_index()` con cache in memoria: l'indice viene letto da disco una sola volta per richiesta PHP
+- `invalidate_by_prefix()` accetta indice pre-caricato come parametro per evitare letture ripetute
+
+---
+
 ## [2.1.1] - 2026-03-09
 
 ### Fix
