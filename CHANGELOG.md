@@ -10,12 +10,16 @@ Tutte le modifiche rilevanti al plugin sono documentate in questo file.
 - **Contatore cache non si resettava**: il pulsante "Svuota tutta la cache" faceva un redirect dopo la cancellazione; nel tempo tra il clear e il ricaricamento della pagina i visitatori ri-cachavano le pagine, mostrando un conteggio non azzerato. Convertito a AJAX con aggiornamento immediato delle statistiche nel DOM
 - **File .ttl cancellato durante lo svuotamento**: `clear_all()` e `cleanup_expired()` non proteggevano il file `.ttl`, resettando il TTL al valore di default (3600s) dopo ogni svuotamento
 - **Sito lento dopo svuotamento cache**: aggiunto warm-up automatico non bloccante delle pagine critiche (homepage e shop) dopo ogni svuotamento (manuale, admin bar, bulk automatico)
+- **Bulk mode: 20.000 query DB per import massivi**: `invalidate_product_cache()` faceva `get_transient()` + `set_transient()` per ogni singolo prodotto durante il bulk. Con 10.000 prodotti = 20.000 query. Ora gli ID vengono accumulati in una proprietà di istanza (`$bulk_pending_ids`) e processati solo in `bulk_end()`
+- **Race condition bulk senza bulk_end()**: se lo script terminava per fatal error o timeout durante un import bulk, gli ID accumulati restavano in un transient orfano per 1 ora senza essere mai processati. Aggiunto `register_shutdown_function()` come fallback di sicurezza
+- **Pagine filtrate non invalidate**: quando un prodotto cambiava, le varianti filtrate delle pagine (es. `/shop/?orderby=price`, `/product-category/scarpe/?min_price=10`) restavano in cache con dati vecchi fino al TTL. Aggiunto indice URL (`.url_index`) mantenuto dal drop-in e invalidazione per prefisso path nel plugin
 
 ### Migliorato
 - Pulsante "Svuota tutta la cache" nella pagina impostazioni ora usa AJAX con spinner e notifica inline
 - Aggiunto `clearstatcache(true)` dopo la cancellazione per garantire letture filesystem aggiornate
 - Il contatore nella admin bar si aggiorna automaticamente dopo lo svuotamento AJAX
 - I file protetti nella directory cache (`.active`, `.excluded_urls`, `.ttl`) ora usano un array centralizzato
+- Nuovo check nello "Stato sistema": Indice URL con conteggio URL indicizzati
 
 ---
 

@@ -200,8 +200,11 @@ if ( file_exists( $cache_file ) ) {
 // MISS: cattura l'output per salvarlo
 header( 'X-OCM-Cache: MISS' );
 
-// Passa il path del file alla callback tramite costante (più affidabile di $GLOBALS)
+// Passa i dati alla callback tramite costanti (più affidabile di $GLOBALS)
 define( 'OCM_CACHE_FILE', $cache_file );
+define( 'OCM_CACHE_KEY', $cache_key );
+define( 'OCM_CACHE_HOST', $cache_host );
+define( 'OCM_CACHE_REQUEST_URI', $request_uri );
 
 /**
  * Callback di output buffering.
@@ -269,6 +272,12 @@ function ocm_cache_output_callback( $html ) {
         @header( 'X-OCM-Save: skip-rename-failed' );
         return $html;
     }
+
+    // Aggiorna l'indice URL per consentire l'invalidazione per prefisso path.
+    // Formato: hash|host|request_uri (una riga per URL cachato).
+    $index_file = OCM_CACHE_DIR . '.url_index';
+    $index_line = OCM_CACHE_KEY . '|' . OCM_CACHE_HOST . '|' . OCM_CACHE_REQUEST_URI . "\n";
+    @file_put_contents( $index_file, $index_line, FILE_APPEND | LOCK_EX );
 
     @header( 'X-OCM-Save: ok' );
     return $html;

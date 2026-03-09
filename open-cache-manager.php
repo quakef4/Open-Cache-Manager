@@ -51,6 +51,14 @@ class Open_Cache_Manager {
     private $bulk_mode = false;
 
     /**
+     * ID prodotti accumulati durante la modalità bulk (in memoria).
+     * Evita di scrivere un transient per ogni singolo prodotto.
+     *
+     * @var array
+     */
+    private $bulk_pending_ids = array();
+
+    /**
      * Costruttore.
      */
     public function __construct() {
@@ -419,11 +427,61 @@ class Open_Cache_Manager {
         $path   = isset( $parsed['path'] ) ? $parsed['path'] : '/';
         $query  = isset( $parsed['query'] ) ? '?' . $parsed['query'] : '';
 
+        // Invalida la versione esatta dell'URL.
         $cache_key  = md5( $host . $path . $query );
         $cache_file = $this->cache_dir . substr( $cache_key, 0, 2 ) . '/' . $cache_key . '.gz';
 
         if ( file_exists( $cache_file ) ) {
             @unlink( $cache_file );
+        }
+
+        // Invalida anche tutte le varianti filtrate/ordinate di questo URL.
+        // Il drop-in usa md5( host + request_uri ) dove request_uri include la query string.
+        // Pagine come /shop/?orderby=price o /product-category/scarpe/?min_price=10
+        // non vengono invalidate dal solo hash esatto sopra.
+        $this->invalidate_by_prefix( $host, $path );
+    }
+
+    /**
+     * Invalida tutti i file cache il cui URL inizia con un determinato path.
+     * Usa l'indice URL se disponibile, altrimenti scansiona le directory.
+     *
+     * @param string $host Hostname del sito.
+     * @param string $path Path URL (es. /shop/, /product-category/scarpe/).
+     */
+    private function invalidate_by_prefix( $host, $path ) {
+        $index_file = $this->cache_dir . '.url_index';
+
+        if ( ! file_exists( $index_file ) ) {
+            return;
+        }
+
+        $index = @file( $index_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+        if ( ! is_array( $index ) ) {
+            return;
+        }
+
+        foreach ( $index as $line ) {
+            // Formato: hash|host|request_uri
+            $parts = explode( '|', $line, 3 );
+            if ( count( $parts ) !== 3 ) {
+                continue;
+            }
+
+            list( $hash, $stored_host, $stored_uri ) = $parts;
+
+            if ( $stored_host !== $host ) {
+                continue;
+            }
+
+            // Controlla se l'URI inizia con il path (copre ?query variants).
+            $stored_path = (string) parse_url( $stored_uri, PHP_URL_PATH );
+            if ( $stored_path === $path ) {
+                $cache_file = $this->cache_dir . substr( $hash, 0, 2 ) . '/' . $hash . '.gz';
+                if ( file_exists( $cache_file ) ) {
+                    @unlink( $cache_file );
+                }
+            }
         }
     }
 
@@ -434,12 +492,7 @@ class Open_Cache_Manager {
      */
     public function invalidate_product_cache( $product_id ) {
         if ( $this->bulk_mode ) {
-            $pending = get_transient( 'ocm_cache_bulk_ids' );
-            if ( ! is_array( $pending ) ) {
-                $pending = array();
-            }
-            $pending[] = $product_id;
-            set_transient( 'ocm_cache_bulk_ids', $pending, HOUR_IN_SECONDS );
+            $this->bulk_pending_ids[] = $product_id;
             return;
         }
 
@@ -510,15 +563,26 @@ class Open_Cache_Manager {
     // =============================================================
 
     public function bulk_start() {
-        $this->bulk_mode = true;
-        set_transient( 'ocm_cache_bulk_ids', array(), HOUR_IN_SECONDS );
+        $this->bulk_mode       = true;
+        $this->bulk_pending_ids = array();
+
+        // Shutdown hook di sicurezza: se lo script termina senza chiamare
+        // bulk_end() (fatal error, timeout, ecc.) processa comunque gli ID
+        // accumulati per non lasciare la cache in uno stato inconsistente.
+        register_shutdown_function( array( $this, 'bulk_end' ) );
     }
 
     public function bulk_end() {
-        $this->bulk_mode = false;
-        $pending = get_transient( 'ocm_cache_bulk_ids' );
+        // Evita doppia esecuzione (chiamata esplicita + shutdown hook).
+        if ( ! $this->bulk_mode && empty( $this->bulk_pending_ids ) ) {
+            return;
+        }
 
-        if ( ! is_array( $pending ) || empty( $pending ) ) {
+        $this->bulk_mode = false;
+        $pending = $this->bulk_pending_ids;
+        $this->bulk_pending_ids = array();
+
+        if ( empty( $pending ) ) {
             return;
         }
 
@@ -534,8 +598,6 @@ class Open_Cache_Manager {
                 $this->invalidate_product_cache( $product_id );
             }
         }
-
-        delete_transient( 'ocm_cache_bulk_ids' );
     }
 
     // =============================================================
@@ -560,6 +622,7 @@ class Open_Cache_Manager {
         );
 
         // File di controllo nella directory cache da preservare durante il clear.
+        // Nota: .url_index viene cancellato insieme ai .gz perché l'indice deve essere coerente.
         $protected_files = array( '.active', '.excluded_urls', '.ttl' );
 
         foreach ( $iterator as $item ) {
@@ -597,7 +660,7 @@ class Open_Cache_Manager {
             new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
         );
 
-        $protected_files = array( '.active', '.excluded_urls', '.ttl' );
+        $protected_files = array( '.active', '.excluded_urls', '.ttl', '.url_index' );
 
         foreach ( $iterator as $file ) {
             if ( $file->isFile() && ( $now - $file->getMTime() ) > $ttl ) {
@@ -961,6 +1024,30 @@ class Open_Cache_Manager {
                 'label'  => 'Cron pulizia automatica',
                 'status' => 'warning',
                 'note'   => 'Non schedulato. Clicca "Reinstalla" per ripristinarlo.',
+            );
+        }
+
+        // 8. Indice URL (invalidazione filtri)
+        $index_file = $this->cache_dir . '.url_index';
+        if ( file_exists( $index_file ) ) {
+            $line_count = 0;
+            $fh = @fopen( $index_file, 'r' );
+            if ( $fh ) {
+                while ( fgets( $fh ) !== false ) {
+                    $line_count++;
+                }
+                fclose( $fh );
+            }
+            $checks[] = array(
+                'label'  => 'Indice URL (invalidazione filtri)',
+                'status' => 'ok',
+                'note'   => 'Attivo — ' . number_format( $line_count ) . ' URL indicizzati',
+            );
+        } else {
+            $checks[] = array(
+                'label'  => 'Indice URL (invalidazione filtri)',
+                'status' => 'warning',
+                'note'   => 'Non ancora creato. Si popola automaticamente quando le pagine vengono cachate.',
             );
         }
 
