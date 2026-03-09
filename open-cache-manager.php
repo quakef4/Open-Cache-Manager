@@ -85,6 +85,9 @@ class Open_Cache_Manager {
         add_action( 'admin_menu',      array( $this, 'add_admin_menu' ) );
         add_action( 'admin_notices',   array( $this, 'admin_notices' ) );
 
+        // AJAX handler per svuotamento cache dalla pagina impostazioni.
+        add_action( 'wp_ajax_ocm_ajax_clear_cache', array( $this, 'ajax_clear_cache' ) );
+
         // -------------------------------------------------------
         // Azione custom per invalidazione bulk
         // -------------------------------------------------------
@@ -525,6 +528,7 @@ class Open_Cache_Manager {
         $unique_ids = array_unique( $pending );
         if ( count( $unique_ids ) > $threshold ) {
             $this->clear_all();
+            $this->warm_critical_pages();
         } else {
             foreach ( $unique_ids as $product_id ) {
                 $this->invalidate_product_cache( $product_id );
@@ -555,10 +559,13 @@ class Open_Cache_Manager {
             RecursiveIteratorIterator::CHILD_FIRST
         );
 
+        // File di controllo nella directory cache da preservare durante il clear.
+        $protected_files = array( '.active', '.excluded_urls', '.ttl' );
+
         foreach ( $iterator as $item ) {
             if ( $item->isFile() ) {
                 $basename = basename( $item->getPathname() );
-                if ( $basename === '.active' || $basename === '.excluded_urls' ) {
+                if ( in_array( $basename, $protected_files, true ) ) {
                     continue;
                 }
                 @unlink( $item->getPathname() );
@@ -567,6 +574,9 @@ class Open_Cache_Manager {
                 @rmdir( $item->getPathname() );
             }
         }
+
+        // Pulisci la stat cache di PHP per garantire che get_stats() legga valori aggiornati.
+        clearstatcache( true );
 
         return $count;
     }
@@ -587,14 +597,55 @@ class Open_Cache_Manager {
             new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
         );
 
+        $protected_files = array( '.active', '.excluded_urls', '.ttl' );
+
         foreach ( $iterator as $file ) {
             if ( $file->isFile() && ( $now - $file->getMTime() ) > $ttl ) {
                 $basename = basename( $file->getPathname() );
-                if ( $basename === '.active' || $basename === '.excluded_urls' ) {
+                if ( in_array( $basename, $protected_files, true ) ) {
                     continue;
                 }
                 @unlink( $file->getPathname() );
             }
+        }
+    }
+
+    /**
+     * Invia richieste non bloccanti alle pagine critiche per riscaldare la cache.
+     * Usa wp_remote_get con timeout minimo e blocking=false per non rallentare la risposta admin.
+     */
+    private function warm_critical_pages() {
+        $urls = array( home_url( '/' ) );
+
+        // Pagina shop WooCommerce.
+        if ( function_exists( 'wc_get_page_permalink' ) ) {
+            $shop_url = wc_get_page_permalink( 'shop' );
+            if ( $shop_url ) {
+                $urls[] = $shop_url;
+            }
+        }
+
+        // URL personalizzati di preload configurati dall'utente.
+        $options     = get_option( 'open_cache_manager', array() );
+        $preload_raw = isset( $options['preload_urls'] ) ? $options['preload_urls'] : '';
+        if ( $preload_raw ) {
+            $custom_urls = array_filter( array_map( 'trim', explode( "\n", $preload_raw ) ) );
+            foreach ( $custom_urls as $custom_url ) {
+                if ( strpos( $custom_url, '/' ) === 0 ) {
+                    $custom_url = home_url( $custom_url );
+                }
+                $urls[] = $custom_url;
+            }
+        }
+
+        $urls = array_unique( $urls );
+
+        foreach ( $urls as $url ) {
+            wp_remote_get( $url, array(
+                'timeout'   => 0.5,
+                'blocking'  => false,
+                'sslverify' => false,
+            ) );
         }
     }
 
@@ -696,6 +747,7 @@ class Open_Cache_Manager {
                 wp_die( 'Non autorizzato' );
             }
             $count = $this->clear_all();
+            $this->warm_critical_pages();
             set_transient( 'ocm_cache_notice', sprintf( 'Cache svuotata! %d file eliminati.', $count ), 30 );
             wp_safe_redirect( wp_get_referer() ? wp_get_referer() : admin_url() );
             exit;
@@ -723,6 +775,34 @@ class Open_Cache_Manager {
             wp_safe_redirect( admin_url( 'admin.php?page=' . $this->options_page ) );
             exit;
         }
+    }
+
+    /**
+     * AJAX handler per svuotamento cache.
+     * Restituisce le statistiche aggiornate dopo lo svuotamento.
+     */
+    public function ajax_clear_cache() {
+        check_ajax_referer( 'ocm_ajax_clear_cache', 'nonce' );
+
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Non autorizzato', 403 );
+        }
+
+        $count = $this->clear_all();
+
+        // Warm-up asincrono delle pagine critiche dopo lo svuotamento.
+        $this->warm_critical_pages();
+
+        $stats = $this->get_stats();
+
+        wp_send_json_success( array(
+            'deleted' => $count,
+            'files'   => $stats['files'],
+            'size'    => $this->format_bytes( $stats['size'] ),
+            'oldest'  => $stats['oldest'] ? date( 'd/m/Y H:i:s', $stats['oldest'] ) : '-',
+            'newest'  => $stats['newest'] ? date( 'd/m/Y H:i:s', $stats['newest'] ) : '-',
+            'message' => sprintf( 'Cache svuotata! %d file eliminati.', $count ),
+        ) );
     }
 
     /**
@@ -1004,25 +1084,67 @@ class Open_Cache_Manager {
             <!-- Statistiche -->
             <div class="card" style="max-width:600px; padding:15px; margin-bottom:20px;">
                 <h2>Statistiche</h2>
+                <div id="ocm-clear-notice" style="display:none; margin-bottom:12px; padding:8px 12px; background:#00a32a; color:#fff; border-radius:3px;"></div>
                 <table class="widefat" style="max-width:400px;">
-                    <tr><th>Pagine in cache</th><td><strong><?php echo (int) $stats['files']; ?></strong></td></tr>
-                    <tr><th>Dimensione totale</th><td><strong><?php echo esc_html( $this->format_bytes( $stats['size'] ) ); ?></strong></td></tr>
+                    <tr><th>Pagine in cache</th><td><strong id="ocm-stat-files"><?php echo (int) $stats['files']; ?></strong></td></tr>
+                    <tr><th>Dimensione totale</th><td><strong id="ocm-stat-size"><?php echo esc_html( $this->format_bytes( $stats['size'] ) ); ?></strong></td></tr>
                     <tr>
                         <th>File più vecchio</th>
-                        <td><?php echo $stats['oldest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['oldest'] ) ) : '-'; ?></td>
+                        <td id="ocm-stat-oldest"><?php echo $stats['oldest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['oldest'] ) ) : '-'; ?></td>
                     </tr>
                     <tr>
                         <th>File più recente</th>
-                        <td><?php echo $stats['newest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['newest'] ) ) : '-'; ?></td>
+                        <td id="ocm-stat-newest"><?php echo $stats['newest'] ? esc_html( date( 'd/m/Y H:i:s', $stats['newest'] ) ) : '-'; ?></td>
                     </tr>
                 </table>
                 <br>
-                <a href="<?php echo wp_nonce_url( admin_url( 'admin.php?action=ocm_clear_cache' ), 'ocm_clear_cache' ); ?>"
-                   class="button button-secondary"
-                   onclick="return confirm('Svuotare tutta la cache?');">
+                <button type="button" id="ocm-clear-cache-btn" class="button button-secondary">
                     Svuota tutta la cache
-                </a>
+                </button>
+                <span id="ocm-clear-spinner" class="spinner" style="float:none; margin-top:0;"></span>
             </div>
+            <script>
+            (function(){
+                var btn     = document.getElementById('ocm-clear-cache-btn');
+                var spinner = document.getElementById('ocm-clear-spinner');
+                var notice  = document.getElementById('ocm-clear-notice');
+
+                btn.addEventListener('click', function(){
+                    if ( ! confirm('Svuotare tutta la cache?') ) return;
+
+                    btn.disabled = true;
+                    spinner.classList.add('is-active');
+                    notice.style.display = 'none';
+
+                    var xhr = new XMLHttpRequest();
+                    xhr.open('POST', ajaxurl, true);
+                    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                    xhr.onreadystatechange = function(){
+                        if ( xhr.readyState !== 4 ) return;
+                        btn.disabled = false;
+                        spinner.classList.remove('is-active');
+
+                        if ( xhr.status === 200 ) {
+                            try {
+                                var res = JSON.parse(xhr.responseText);
+                                if ( res.success && res.data ) {
+                                    document.getElementById('ocm-stat-files').textContent  = res.data.files;
+                                    document.getElementById('ocm-stat-size').textContent   = res.data.size;
+                                    document.getElementById('ocm-stat-oldest').textContent = res.data.oldest;
+                                    document.getElementById('ocm-stat-newest').textContent = res.data.newest;
+                                    notice.textContent    = res.data.message;
+                                    notice.style.display  = 'block';
+                                    /* Aggiorna anche il contatore nella admin bar */
+                                    var abNode = document.querySelector('#wp-admin-bar-ocm-cache .ab-item');
+                                    if ( abNode ) abNode.textContent = 'OCM Cache (' + res.data.files + ')';
+                                }
+                            } catch(e) {}
+                        }
+                    };
+                    xhr.send('action=ocm_ajax_clear_cache&nonce=<?php echo wp_create_nonce( 'ocm_ajax_clear_cache' ); ?>');
+                });
+            })();
+            </script>
 
             <!-- Impostazioni -->
             <form method="post">
