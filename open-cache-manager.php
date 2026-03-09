@@ -203,8 +203,8 @@ class Open_Cache_Manager {
         // STEP 4: rimuovi cron
         wp_clear_scheduled_hook( 'ocm_cache_cleanup' );
 
-        // STEP 5: svuota cache
-        $this->clear_all();
+        // STEP 5: svuota cache (hard: cancella file fisicamente)
+        $this->hard_clear_all();
 
         // STEP 6: rimuovi directory cache
         $this->remove_cache_directory();
@@ -605,11 +605,61 @@ class Open_Cache_Manager {
     // =============================================================
 
     /**
-     * Svuota tutta la cache.
+     * Svuota tutta la cache (soft purge).
+     *
+     * Non cancella fisicamente i file .gz: scrive un marker `.invalidated_at`
+     * con il timestamp corrente. Il drop-in advanced-cache.php confronta il
+     * mtime dei file con questo marker e li considera stale.
+     *
+     * Stale-while-revalidate: il drop-in continua a servire i file stale ai
+     * visitatori (zero lag) mentre un processo alla volta rigenera la pagina.
+     * Questo elimina il "thundering herd" che rallentava il sito dopo ogni clear.
+     *
+     * @return int Numero di file invalidati.
+     */
+    public function clear_all() {
+        if ( ! is_dir( $this->cache_dir ) ) {
+            return 0;
+        }
+
+        // Conta i file .gz che verranno invalidati.
+        $count = 0;
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
+        );
+        foreach ( $iterator as $file ) {
+            if ( $file->isFile() && $file->getExtension() === 'gz' ) {
+                $count++;
+            }
+        }
+
+        // Scrivi il marker di invalidazione. Il drop-in lo legge per capire
+        // che i file con mtime < questo timestamp sono stale.
+        @file_put_contents(
+            $this->cache_dir . '.invalidated_at',
+            (string) time(),
+            LOCK_EX
+        );
+
+        // Cancella l'indice URL: verrà ricostruito man mano che le pagine
+        // vengono rigenerate dal drop-in.
+        $index_file = $this->cache_dir . '.url_index';
+        if ( file_exists( $index_file ) ) {
+            @unlink( $index_file );
+        }
+
+        clearstatcache( true );
+
+        return $count;
+    }
+
+    /**
+     * Cancella fisicamente i file .gz dalla cache (hard purge).
+     * Usato dalla disattivazione del plugin e dal cron per file scaduti.
      *
      * @return int Numero di file eliminati.
      */
-    public function clear_all() {
+    private function hard_clear_all() {
         $count = 0;
 
         if ( ! is_dir( $this->cache_dir ) ) {
@@ -621,8 +671,7 @@ class Open_Cache_Manager {
             RecursiveIteratorIterator::CHILD_FIRST
         );
 
-        // File di controllo nella directory cache da preservare durante il clear.
-        // Nota: .url_index viene cancellato insieme ai .gz perché l'indice deve essere coerente.
+        // File di controllo nella directory cache da preservare.
         $protected_files = array( '.active', '.excluded_urls', '.ttl' );
 
         foreach ( $iterator as $item ) {
@@ -638,7 +687,6 @@ class Open_Cache_Manager {
             }
         }
 
-        // Pulisci la stat cache di PHP per garantire che get_stats() legga valori aggiornati.
         clearstatcache( true );
 
         return $count;
@@ -656,20 +704,64 @@ class Open_Cache_Manager {
         $ttl     = isset( $options['ttl'] ) ? (int) $options['ttl'] : $this->default_ttl;
         $now     = time();
 
+        // Leggi timestamp di invalidazione soft purge.
+        $inv_file       = $this->cache_dir . '.invalidated_at';
+        $invalidated_at = file_exists( $inv_file ) ? (int) @file_get_contents( $inv_file ) : 0;
+
         $iterator = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
+            new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::CHILD_FIRST
         );
 
-        $protected_files = array( '.active', '.excluded_urls', '.ttl', '.url_index' );
+        $protected_files = array( '.active', '.excluded_urls', '.ttl', '.url_index', '.invalidated_at' );
+        $stale_deleted   = 0;
+        $stale_remaining = 0;
 
-        foreach ( $iterator as $file ) {
-            if ( $file->isFile() && ( $now - $file->getMTime() ) > $ttl ) {
-                $basename = basename( $file->getPathname() );
+        foreach ( $iterator as $item ) {
+            if ( $item->isFile() ) {
+                $basename = basename( $item->getPathname() );
                 if ( in_array( $basename, $protected_files, true ) ) {
                     continue;
                 }
-                @unlink( $file->getPathname() );
+
+                // Cancella lock file orfani (> 60s).
+                if ( substr( $basename, -5 ) === '.lock' ) {
+                    if ( ( $now - $item->getMTime() ) > 60 ) {
+                        @unlink( $item->getPathname() );
+                    }
+                    continue;
+                }
+
+                // Cancella file tmp orfani (> 60s).
+                if ( strpos( $basename, '.tmp.' ) !== false ) {
+                    if ( ( $now - $item->getMTime() ) > 60 ) {
+                        @unlink( $item->getPathname() );
+                    }
+                    continue;
+                }
+
+                $mtime = $item->getMTime();
+
+                // File scaduto per TTL → cancella.
+                if ( ( $now - $mtime ) > $ttl ) {
+                    @unlink( $item->getPathname() );
+                    continue;
+                }
+
+                // File stale (invalidato) che non è stato ancora rigenerato.
+                // Il drop-in li rigenera on-demand. Al cron seguente verranno
+                // cancellati se ancora stale.
+                if ( $invalidated_at > 0 && $mtime < $invalidated_at ) {
+                    $stale_remaining++;
+                }
+            } elseif ( $item->isDir() ) {
+                @rmdir( $item->getPathname() );
             }
+        }
+
+        // Se tutti i file stale sono stati rigenerati, rimuovi il marker di invalidazione.
+        if ( $invalidated_at > 0 && $stale_remaining === 0 ) {
+            @unlink( $inv_file );
         }
     }
 
@@ -733,15 +825,25 @@ class Open_Cache_Manager {
             return $stats;
         }
 
+        // Leggi il timestamp di invalidazione: i file con mtime anteriore sono stale.
+        $inv_file      = $this->cache_dir . '.invalidated_at';
+        $invalidated_at = file_exists( $inv_file ) ? (int) @file_get_contents( $inv_file ) : 0;
+
         $iterator = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator( $this->cache_dir, RecursiveDirectoryIterator::SKIP_DOTS )
         );
 
         foreach ( $iterator as $file ) {
             if ( $file->isFile() && $file->getExtension() === 'gz' ) {
+                $mtime = $file->getMTime();
+
+                // Ignora i file stale (invalidati da soft purge).
+                if ( $invalidated_at > 0 && $mtime < $invalidated_at ) {
+                    continue;
+                }
+
                 $stats['files']++;
                 $stats['size'] += $file->getSize();
-                $mtime = $file->getMTime();
 
                 if ( $stats['oldest'] === 0 || $mtime < $stats['oldest'] ) {
                     $stats['oldest'] = $mtime;

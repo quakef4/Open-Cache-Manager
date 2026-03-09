@@ -10,8 +10,10 @@
  * Diagnostica: ogni richiesta riceve uno di questi header HTTP:
  *   X-OCM-Loaded: 1              → drop-in caricato correttamente
  *   X-OCM-Skip: {motivo}         → drop-in attivo ma ha saltato questa richiesta
- *   X-OCM-Cache: HIT             → pagina servita dalla cache
+ *   X-OCM-Cache: HIT             → pagina servita dalla cache (fresca)
+ *   X-OCM-Cache: STALE           → pagina servita dalla cache (stale, in rigenerazione)
  *   X-OCM-Cache: MISS            → pagina non in cache, verrà salvata
+ *   X-OCM-Cache: REGEN           → pagina in rigenerazione (questo processo la rigenera)
  *
  * @package Open_Cache_Manager
  * @version 2.1.1
@@ -168,43 +170,94 @@ $cache_key  = md5( $cache_host . $request_uri );
 $cache_sub  = substr( $cache_key, 0, 2 );
 $cache_file = OCM_CACHE_DIR . $cache_sub . '/' . $cache_key . '.gz';
 
-// HIT: serve il file dalla cache se valido
-if ( file_exists( $cache_file ) ) {
-    $file_age = time() - filemtime( $cache_file );
+// Timestamp di invalidazione globale (scritto da clear_all con soft purge).
+$invalidated_at_file = OCM_CACHE_DIR . '.invalidated_at';
+$invalidated_at      = file_exists( $invalidated_at_file ) ? (int) @file_get_contents( $invalidated_at_file ) : 0;
 
-    if ( $file_age < OCM_CACHE_TTL ) {
-        header( 'X-OCM-Cache: HIT' );
-        header( 'X-OCM-Cache-Age: ' . $file_age . 's' );
-        header( 'Content-Type: text/html; charset=UTF-8' );
+// Funzione helper per servire un file .gz cached.
+function ocm_serve_cached_file( $file ) {
+    header( 'Content-Type: text/html; charset=UTF-8' );
 
-        $accepts_gzip = isset( $_SERVER['HTTP_ACCEPT_ENCODING'] )
-            && strpos( $_SERVER['HTTP_ACCEPT_ENCODING'], 'gzip' ) !== false;
+    $accepts_gzip = isset( $_SERVER['HTTP_ACCEPT_ENCODING'] )
+        && strpos( $_SERVER['HTTP_ACCEPT_ENCODING'], 'gzip' ) !== false;
 
-        if ( $accepts_gzip ) {
-            header( 'Content-Encoding: gzip' );
-            header( 'Vary: Accept-Encoding' );
-            readfile( $cache_file );
-        } else {
-            $gz = file_get_contents( $cache_file );
-            if ( $gz !== false ) {
-                echo gzdecode( $gz );
-            }
+    if ( $accepts_gzip ) {
+        header( 'Content-Encoding: gzip' );
+        header( 'Vary: Accept-Encoding' );
+        readfile( $file );
+    } else {
+        $gz = file_get_contents( $file );
+        if ( $gz !== false ) {
+            echo gzdecode( $gz );
         }
-        exit;
     }
-
-    // File scaduto: elimina e rigenera
-    @unlink( $cache_file );
+    exit;
 }
 
-// MISS: cattura l'output per salvarlo
-header( 'X-OCM-Cache: MISS' );
+if ( file_exists( $cache_file ) ) {
+    $file_mtime = filemtime( $cache_file );
+    $file_age   = time() - $file_mtime;
 
-// Passa i dati alla callback tramite costanti (più affidabile di $GLOBALS)
+    // Il file è stato invalidato globalmente (soft purge da clear_all)?
+    $is_stale = ( $invalidated_at > 0 && $file_mtime < $invalidated_at );
+
+    if ( ! $is_stale && $file_age < OCM_CACHE_TTL ) {
+        // HIT: file fresco e non invalidato → serve direttamente.
+        header( 'X-OCM-Cache: HIT' );
+        header( 'X-OCM-Cache-Age: ' . $file_age . 's' );
+        ocm_serve_cached_file( $cache_file );
+    }
+
+    // Il file è stale (invalidato) o scaduto per TTL.
+    // Strategia stale-while-revalidate:
+    // - Un solo processo acquisisce il lock e rigenera la pagina (REGEN)
+    // - Tutti gli altri servono il contenuto stale (STALE) → zero lag
+    $lock_file = $cache_file . '.lock';
+
+    // Prova ad acquisire il lock in modo atomico (fopen 'x' fallisce se il file esiste).
+    $lock_acquired = false;
+    $lock_fh       = @fopen( $lock_file, 'x' );
+
+    if ( $lock_fh ) {
+        fclose( $lock_fh );
+        $lock_acquired = true;
+    } else {
+        // Lock esistente: controlla se è stale (> 30s = il processo precedente è morto).
+        if ( file_exists( $lock_file ) && ( time() - @filemtime( $lock_file ) ) > 30 ) {
+            @unlink( $lock_file );
+            $lock_fh = @fopen( $lock_file, 'x' );
+            if ( $lock_fh ) {
+                fclose( $lock_fh );
+                $lock_acquired = true;
+            }
+        }
+    }
+
+    if ( ! $lock_acquired ) {
+        // Un altro processo sta rigenerando → servi il contenuto stale (veloce!).
+        header( 'X-OCM-Cache: STALE' );
+        header( 'X-OCM-Cache-Age: ' . $file_age . 's' );
+        ocm_serve_cached_file( $cache_file );
+    }
+
+    // Questo processo ha il lock → rigenera la pagina.
+    // Il file .gz viene sovrascritto dalla callback di output buffering.
+    header( 'X-OCM-Cache: REGEN' );
+    // Fall through a ob_start() sotto.
+
+} else {
+    // File non esiste → MISS classico.
+    header( 'X-OCM-Cache: MISS' );
+}
+
+// MISS o REGEN: cattura l'output per salvarlo.
+
+// Passa i dati alla callback tramite costanti (più affidabile di $GLOBALS).
 define( 'OCM_CACHE_FILE', $cache_file );
 define( 'OCM_CACHE_KEY', $cache_key );
 define( 'OCM_CACHE_HOST', $cache_host );
 define( 'OCM_CACHE_REQUEST_URI', $request_uri );
+define( 'OCM_LOCK_FILE', isset( $lock_file ) ? $lock_file : '' );
 
 /**
  * Callback di output buffering.
@@ -218,18 +271,21 @@ function ocm_cache_output_callback( $html ) {
     // Non salvare pagine troppo corte (probabile redirect o errore)
     if ( strlen( $html ) < 500 ) {
         @header( 'X-OCM-Save: skip-short-' . strlen( $html ) );
+        ocm_cleanup_lock();
         return $html;
     }
 
     // Non salvare se non sembra HTML valido
     if ( stripos( $html, '<html' ) === false && stripos( $html, '<!DOCTYPE' ) === false ) {
         @header( 'X-OCM-Save: skip-no-html' );
+        ocm_cleanup_lock();
         return $html;
     }
 
     // Non salvare pagine con messaggi di errore WooCommerce visibili
     if ( strpos( $html, 'woocommerce-error' ) !== false ) {
         @header( 'X-OCM-Save: skip-woo-error' );
+        ocm_cleanup_lock();
         return $html;
     }
 
@@ -240,6 +296,7 @@ function ocm_cache_output_callback( $html ) {
     if ( ! is_dir( $cache_dir ) ) {
         if ( ! @mkdir( $cache_dir, 0755, true ) ) {
             @header( 'X-OCM-Save: skip-mkdir-failed' );
+            ocm_cleanup_lock();
             return $html;
         }
     }
@@ -252,24 +309,28 @@ function ocm_cache_output_callback( $html ) {
     // Comprimi e salva con scrittura atomica (tmp → rename)
     if ( ! function_exists( 'gzencode' ) ) {
         @header( 'X-OCM-Save: skip-no-gzencode' );
+        ocm_cleanup_lock();
         return $html;
     }
 
     $compressed = gzencode( $html, 6 );
     if ( $compressed === false ) {
         @header( 'X-OCM-Save: skip-gzencode-failed' );
+        ocm_cleanup_lock();
         return $html;
     }
 
     $tmp = $cache_file . '.tmp.' . getmypid();
     if ( @file_put_contents( $tmp, $compressed, LOCK_EX ) === false ) {
         @header( 'X-OCM-Save: skip-write-failed path=' . $tmp );
+        ocm_cleanup_lock();
         return $html;
     }
 
     if ( ! @rename( $tmp, $cache_file ) ) {
         @unlink( $tmp );
         @header( 'X-OCM-Save: skip-rename-failed' );
+        ocm_cleanup_lock();
         return $html;
     }
 
@@ -279,8 +340,18 @@ function ocm_cache_output_callback( $html ) {
     $index_line = OCM_CACHE_KEY . '|' . OCM_CACHE_HOST . '|' . OCM_CACHE_REQUEST_URI . "\n";
     @file_put_contents( $index_file, $index_line, FILE_APPEND | LOCK_EX );
 
+    ocm_cleanup_lock();
     @header( 'X-OCM-Save: ok' );
     return $html;
+}
+
+/**
+ * Rimuove il lock file dopo il salvataggio o in caso di errore.
+ */
+function ocm_cleanup_lock() {
+    if ( defined( 'OCM_LOCK_FILE' ) && OCM_LOCK_FILE !== '' && file_exists( OCM_LOCK_FILE ) ) {
+        @unlink( OCM_LOCK_FILE );
+    }
 }
 
 ob_start( 'ocm_cache_output_callback' );
